@@ -746,6 +746,10 @@ def rocm_aiter_sparse_attn_indexer(
             scale_fmt,
         )
 
+    # MTP draft iters reuse step-0's top-k: skip the recompute (k_cache already inserted).
+    if get_forward_context().skip_mtp_topk:
+        return topk_indices_buffer
+
     topk_indices_buffer[: hidden_states.shape[0]] = -1
     if has_prefill:
         prefill_metadata = layer_attn_metadata.prefill

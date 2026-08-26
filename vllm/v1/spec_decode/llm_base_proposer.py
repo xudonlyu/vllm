@@ -586,6 +586,8 @@ class SpecDecodeBaseProposer:
             slot_mapping=self._get_slot_mapping(
                 slot_mapping_size, common_attn_metadata.slot_mapping
             ),
+            # step 0 computes the indexer top-k; draft iters below reuse it.
+            skip_mtp_topk=False,
         ):
             ret_hidden_states = self.model(**model_kwargs)
             if not self.model_returns_tuple():
@@ -743,6 +745,8 @@ class SpecDecodeBaseProposer:
                 num_tokens_across_dp=batch_size_across_dp,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
                 slot_mapping=self._get_slot_mapping(input_batch_size),
+                # reuse step-0's indexer top-k for draft iters (index_share_for_mtp_iteration)
+                skip_mtp_topk=self._share_mtp_indices,
             ):
                 ret_hidden_states = self.model(**model_kwargs)
                 if not self.model_returns_tuple():

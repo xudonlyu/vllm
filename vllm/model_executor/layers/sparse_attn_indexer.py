@@ -402,6 +402,10 @@ def sparse_attn_indexer(
             scale_fmt,
         )
 
+    # MTP draft iters reuse step-0's top-k: skip the recompute (k_cache already inserted).
+    if get_forward_context().skip_mtp_topk:
+        return topk_indices_buffer
+
     # The buffer must be pre-filled with -1 (the "no token" sentinel) before the
     # top-k kernels scatter valid indices into it. On the fused deepseek_v32
     # nvidia path, _fused_norm_rope_kernel already cleared the same

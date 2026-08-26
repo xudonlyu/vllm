@@ -1482,6 +1482,63 @@ def _fused_mla_dual_rms_norm_per_group_quant_fake(
     return q_out, q_scale, kv_normed
 
 
+def _fused_qk_rope_concat_and_cache_mla_impl(
+    q_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    kv_c: torch.Tensor,
+    k_pe: torch.Tensor,
+    kv_cache: torch.Tensor,
+    q_out: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    k_scale: torch.Tensor,
+    q_scale: torch.Tensor,
+    positions: torch.Tensor,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    is_neox: bool,
+    is_nope_first: bool,
+) -> None:
+    """Fused MLA rope(q_pe,k_pe) + concat(q_nope,q_pe->q_out) + concat(kv_c,k_pe)
+    write to paged KV cache, with fp8 quant. Writes q_out and kv_cache in place."""
+    import aiter
+
+    aiter.fused_qk_rope_concat_and_cache_mla(
+        q_nope,
+        q_pe,
+        kv_c,
+        k_pe,
+        kv_cache,
+        q_out,
+        slot_mapping,
+        k_scale,
+        q_scale,
+        positions,
+        cos_cache,
+        sin_cache,
+        is_neox,
+        is_nope_first,
+    )
+
+
+def _fused_qk_rope_concat_and_cache_mla_fake(
+    q_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    kv_c: torch.Tensor,
+    k_pe: torch.Tensor,
+    kv_cache: torch.Tensor,
+    q_out: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    k_scale: torch.Tensor,
+    q_scale: torch.Tensor,
+    positions: torch.Tensor,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    is_neox: bool,
+    is_nope_first: bool,
+) -> None:
+    return None
+
+
 def _rocm_aiter_gemm_a8wfp4_impl(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -2191,6 +2248,14 @@ class rocm_aiter_ops:
                 fake_impl=_fused_mla_dual_rms_norm_per_group_quant_fake,
             )
 
+            direct_register_custom_op(
+                op_name="fused_qk_rope_concat_and_cache_mla",
+                op_func=_fused_qk_rope_concat_and_cache_mla_impl,
+                mutates_args=["kv_cache", "q_out"],
+                fake_impl=_fused_qk_rope_concat_and_cache_mla_fake,
+                dispatch_key=current_platform.dispatch_key,
+            )
+
             _OPS_REGISTERED = True
 
     @staticmethod
@@ -2261,6 +2326,40 @@ class rocm_aiter_ops:
     @staticmethod
     def get_per_1x128_group_quant_op() -> OpOverload:
         return torch.ops.vllm.rocm_aiter_per_1x128_group_quant.default
+
+    @staticmethod
+    def fused_qk_rope_concat_and_cache_mla(
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        kv_c: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_cache: torch.Tensor,
+        q_out: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        k_scale: torch.Tensor,
+        q_scale: torch.Tensor,
+        positions: torch.Tensor,
+        cos_cache: torch.Tensor,
+        sin_cache: torch.Tensor,
+        is_neox: bool,
+        is_nope_first: bool = True,
+    ) -> None:
+        torch.ops.vllm.fused_qk_rope_concat_and_cache_mla(
+            q_nope,
+            q_pe,
+            kv_c,
+            k_pe,
+            kv_cache,
+            q_out,
+            slot_mapping,
+            k_scale,
+            q_scale,
+            positions,
+            cos_cache,
+            sin_cache,
+            is_neox,
+            is_nope_first,
+        )
 
     @staticmethod
     def w8a8_gemm(

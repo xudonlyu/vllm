@@ -586,6 +586,69 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             )
         return self._chunked_prefill_workspace_size
 
+    def _fused_mla_rope_cache_active(self) -> bool:
+        # Fuse rope(q_pe,k_pe) + q-concat + fp8 q-quant + paged fp8 KV-cache
+        # write into aiter's fused_qk_rope_concat_and_cache_mla (ROCm sparse fp8
+        # MLA only). The kernel applies rope internally, so the wrapper feeds
+        # UN-roped q_pe/k_pe and defers rope here (see mla.py forward).
+        # Note: the impl need not set supports_quant_query_input; the fused op
+        # emits an fp8 q tensor which forward_mqa passes through un-requantized.
+        return (
+            envs.VLLM_ROCM_FUSED_MLA_ROPE_CACHE
+            and self.impl.is_sparse
+            and is_quantized_kv_cache(self.kv_cache_dtype)
+        )
+
+    def _fused_rope_cos_sin(self, rope: torch.nn.Module) -> tuple:
+        # Split vLLM's [max_pos, rot_dim] cos_sin_cache into the [max_pos,
+        # rot_dim//2] cos/sin caches aiter's kernel expects. Cached per module.
+        cached = getattr(self, "_fused_cos_sin", None)
+        if cached is None or cached[0] is not rope:
+            half = rope.rotary_dim // 2
+            # aiter's kernel reads cos/sin as bf16 (matching the q/k dtype);
+            # passing fp32 misaligns the reads and corrupts the pe segment.
+            cache = rope.cos_sin_cache
+            cos = cache[..., :half].contiguous().to(torch.bfloat16)
+            sin = cache[..., half:].contiguous().to(torch.bfloat16)
+            self._fused_cos_sin = (rope, cos, sin)
+            cached = self._fused_cos_sin
+        return cached[1], cached[2]
+
+    def _fused_rope_concat_cache(
+        self,
+        ql_nope: torch.Tensor,  # [tokens, heads, kv_lora_rank]
+        q_pe: torch.Tensor,  # [tokens, heads, pe] (UN-roped)
+        kv_c: torch.Tensor,  # [tokens, kv_lora_rank]
+        k_pe: torch.Tensor,  # [tokens, 1, pe] or [tokens, pe] (UN-roped)
+        kv_cache: torch.Tensor,
+    ) -> torch.Tensor:
+        t, h, lora = ql_nope.shape
+        pe = q_pe.shape[-1]
+        q_out = ql_nope.new_empty((t, h, lora + pe), dtype=_FP8_DTYPE)
+        positions, rope = self._fused_rope_inputs
+        cos, sin = self._fused_rope_cos_sin(rope)
+        slot_mapping = get_forward_context().slot_mapping.get(self.layer_name)
+        # ql_nope is a transpose view and q_pe/k_pe are slices; the aiter
+        # kernel reads them as contiguous, so materialize contiguous inputs.
+        k_pe = k_pe.squeeze(1) if k_pe.dim() == 3 else k_pe
+        rocm_aiter_ops.fused_qk_rope_concat_and_cache_mla(
+            ql_nope.contiguous(),
+            q_pe.contiguous(),
+            kv_c.contiguous(),
+            k_pe.contiguous(),
+            kv_cache,
+            q_out,
+            slot_mapping,
+            self._k_scale,
+            self._q_scale,
+            positions[:t],
+            cos,
+            sin,
+            rope.is_neox_style,
+            True,  # is_nope_first: q_out=[nope,pe], cache=[kv_c,k_pe]
+        )
+        return q_out
+
     def forward(
         self,
         q: torch.Tensor,
@@ -631,14 +694,17 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     self.use_pcp,
                 )
             )
-            self.impl.do_kv_cache_update(  # type: ignore[attr-defined]
-                kv_for_cache,
-                kpe_for_cache,
-                self_kv_cache,
-                layer_slot_mapping,
-                self.kv_cache_dtype,
-                self._k_scale,
-            )
+            if not self._fused_mla_rope_cache_active():
+                # When fused, the KV-cache write happens inside forward_impl's
+                # fused_qk_rope_concat_and_cache_mla call (needs the absorbed q).
+                self.impl.do_kv_cache_update(  # type: ignore[attr-defined]
+                    kv_for_cache,
+                    kpe_for_cache,
+                    self_kv_cache,
+                    layer_slot_mapping,
+                    self.kv_cache_dtype,
+                    self._k_scale,
+                )
             output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
             self.forward_impl(
                 q,
@@ -651,13 +717,17 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             return output
         else:
             encoded = _encode_layer_name(self.layer_name)
-            kv_cache_dummy_dep = torch.ops.vllm.unified_mla_kv_cache_update(
-                kv_c_normed,
-                k_pe,
-                encoded,
-                self.kv_cache_dtype,
-                self._k_scale,
-            )
+            if self._fused_mla_rope_cache_active():
+                # KV-cache write is fused into forward_impl (ordered internally).
+                kv_cache_dummy_dep = None
+            else:
+                kv_cache_dummy_dep = torch.ops.vllm.unified_mla_kv_cache_update(
+                    kv_c_normed,
+                    k_pe,
+                    encoded,
+                    self.kv_cache_dtype,
+                    self._k_scale,
+                )
             output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
             torch.ops.vllm.unified_mla_attention_with_output(
                 q,
@@ -848,7 +918,12 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 # Convert from (N, B, L) to (B, N, L)
                 mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
 
-            if fp8_attention and self.impl.supports_quant_query_input:
+            if self._fused_mla_rope_cache_active():
+                # fused: q concat + fp8 quant + paged fp8 KV-cache write
+                mqa_q = self._fused_rope_concat_cache(
+                    mqa_ql_nope, mqa_q_pe, k_c_normed, k_pe, kv_cache
+                )
+            elif fp8_attention and self.impl.supports_quant_query_input:
                 assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]
                 assert mqa_ql_nope.shape[1] == mqa_q_pe.shape[1]
                 mqa_q = self._decode_concat_quant_fp8_op(

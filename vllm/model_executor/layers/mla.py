@@ -162,9 +162,14 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         k_pe = k_pe.unsqueeze(1)
 
         if self.rotary_emb is not None:
-            q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
-                positions, q[..., self.qk_nope_head_dim :], k_pe
-            )
+            if self.mla_attn._fused_mla_rope_cache_active():
+                # rope is fused into the KV-cache-write kernel; feed it un-roped
+                # q_pe/k_pe plus the rope context instead of applying rope here.
+                self.mla_attn._fused_rope_inputs = (positions, self.rotary_emb)
+            else:
+                q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
+                    positions, q[..., self.qk_nope_head_dim :], k_pe
+                )
 
         if self.indexer and self.is_sparse and not self.skip_topk:
             self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)

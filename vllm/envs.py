@@ -130,6 +130,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR_HIPBMM: bool = False
     VLLM_ROCM_FP8_BLOCKSCALE_PRESHUFFLE: bool = False
+    VLLM_ROCM_FUSED_MLA_ROPE_CACHE: bool = False
     VLLM_ROCM_USE_AITER_MOE: bool = True
     VLLM_ROCM_AITER_MOE_DISPATCH_POLICY: int = 0
     VLLM_ROCM_USE_AITER_RMSNORM: bool = True
@@ -1207,6 +1208,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ROCM_FP8_BLOCKSCALE_PRESHUFFLE": lambda: (
         os.getenv("VLLM_ROCM_FP8_BLOCKSCALE_PRESHUFFLE", "False").lower()
         in ("true", "1")
+    ),
+    # Fuse MLA q/k rope + concat + paged KV-cache write + fp8 quant into aiter's
+    # fused_qk_rope_concat_and_cache_mla (ROCm sparse fp8 MLA only).
+    "VLLM_ROCM_FUSED_MLA_ROPE_CACHE": lambda: (
+        os.getenv("VLLM_ROCM_FUSED_MLA_ROPE_CACHE", "False").lower() in ("true", "1")
     ),
     # Whether to use aiter moe ops.
     # By default is enabled.

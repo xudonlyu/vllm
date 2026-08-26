@@ -1050,6 +1050,102 @@ class MLADualRMSPerTokenQuantPattern(
         return _replacement
 
 
+class MLADualRMSGroupQuantPattern(
+    VllmPatternReplacement[
+        ...,
+        tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+        ],
+    ]
+):
+    """
+    Fuse the MLA FP8 attention path -- q-latent RMSNorm + FP8 *per-group* (1x128)
+    quant plus kv-latent RMSNorm -- into AITER's ``fused_qk_rmsnorm_group_quant``.
+
+    Unlike the per-token path, there is no earlier RMSNorm+quant fusion for the
+    block-scale (1x128) q_b_proj GEMM, so the q side is a plain ``rms_norm``
+    feeding ``rocm_aiter_per_1x128_group_quant`` (transposed scale)::
+
+        gemm -> split_with_sizes([q_dim, kv_dim])
+            +-- q_c     -> rms_norm -> per_1x128_group_quant -> (q_fp8, q_scale)
+            +-- kv_lora -> split_with_sizes([kv_c_dim, k_pe_dim])
+                            +-- kv_c -> rms_norm -> kv_normed (bf16)
+                            +-- k_pe
+    """
+
+    GROUP_QUANT_OP = rocm_aiter_ops.get_per_1x128_group_quant_op()
+    FUSED_OP = rocm_aiter_ops.get_fused_mla_dual_rms_norm_per_group_quant_op()
+
+    def __init__(self, epsilon: float) -> None:
+        self._epsilon = epsilon
+
+    def get_inputs(self) -> list[torch.Tensor]:
+        q_dim, kv_c_dim, k_pe_dim = 256, 128, 64
+        return [
+            self.empty_bf16(5, q_dim + kv_c_dim + k_pe_dim),
+            self.empty_bf16(q_dim),
+            self.empty_bf16(kv_c_dim),
+        ]
+
+    @property
+    def pattern(
+        self,
+    ) -> Callable[
+        ...,
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    ]:
+        eps = self._epsilon
+        group_quant_op = self.GROUP_QUANT_OP
+
+        def _pattern(
+            projected: torch.Tensor,
+            q_weight: torch.Tensor,
+            kv_weight: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            q_dim = q_weight.shape[0]
+            kv_dim = projected.shape[-1] - q_dim
+            kv_c_dim = kv_weight.shape[0]
+            k_pe_dim = kv_dim - kv_c_dim
+            q_c, kv_lora = projected.split([q_dim, kv_dim], dim=-1)
+            kv_c, k_pe = kv_lora.split([kv_c_dim, k_pe_dim], dim=-1)
+            q_normed = vllm.ir.ops.rms_norm(q_c, q_weight, eps)
+            q_quant = group_quant_op(q_normed, True)
+            kv_normed = vllm.ir.ops.rms_norm(kv_c, kv_weight, eps)
+            return q_quant[0], q_quant[1], kv_normed, k_pe
+
+        return _pattern
+
+    @property
+    def replacement(
+        self,
+    ) -> Callable[
+        ...,
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    ]:
+        eps = self._epsilon
+        fused_op = self.FUSED_OP
+
+        def _replacement(
+            projected: torch.Tensor,
+            q_weight: torch.Tensor,
+            kv_weight: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            q_dim = q_weight.shape[0]
+            kv_dim = projected.shape[-1] - q_dim
+            kv_c_dim = kv_weight.shape[0]
+            k_pe_dim = kv_dim - kv_c_dim
+            q_c, kv_lora = projected.split([q_dim, kv_dim], dim=-1)
+            kv_c, k_pe = kv_lora.split([kv_c_dim, k_pe_dim], dim=-1)
+            at = fused_op(q_c, q_weight, kv_c, kv_weight, eps, eps)
+            # q_fp8, q_scale, kv_normed, k_pe
+            return at[0], at[1], at[2], k_pe
+
+        return _replacement
+
+
 class MLADualRMSNormFusionPass(VllmFusionPatternMatcherPass):
     """
     Post-grad PatternMatcher pass that fuses paired q / kv RMS norms in
@@ -1067,5 +1163,8 @@ class MLADualRMSNormFusionPass(VllmFusionPatternMatcherPass):
         super().__init__(config, "mla_dual_rms_norm_fusion_pass")
 
         for epsilon in [1e-5, 1e-6]:
+            # Register the more specific group-quant pattern first so it wins
+            # over the RMSNorm-only pattern on the block-scale (1x128) q_b_proj.
+            self.register(MLADualRMSGroupQuantPattern(epsilon))
             self.register(MLADualRMSNormPattern(epsilon))
             self.register(MLADualRMSPerTokenQuantPattern(epsilon))

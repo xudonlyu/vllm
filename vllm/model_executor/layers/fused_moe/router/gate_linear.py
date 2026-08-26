@@ -58,9 +58,11 @@ class GateLinear(ReplicatedLinear):
     ):
         is_hopper = current_platform.is_device_capability((9, 0))
         is_blackwell = current_platform.is_device_capability_family(100)
+        # ROCm keeps bf16 weights and takes the bf16->fp32 tier below.
         can_use_specialized_kernels = (
-            current_platform.is_cuda() and (is_hopper or is_blackwell) and not bias
-        )
+            (current_platform.is_cuda() and (is_hopper or is_blackwell))
+            or current_platform.is_rocm()
+        ) and not bias
 
         # If fp32 compute is required and no specialized kernel is available,
         # store weights in fp32 so the fallback linear path computes in fp32.
@@ -81,6 +83,7 @@ class GateLinear(ReplicatedLinear):
         self.allow_specialized_router_gemm = can_use_specialized_kernels
         self.allow_dsv3_router_gemm = (
             self.allow_specialized_router_gemm
+            and current_platform.is_cuda()
             and self.weight.dtype == torch.bfloat16
             and output_size in self.DSV3_SUPPORTED_NUM_EXPERTS
             and input_size in self.DSV3_SUPPORTED_HIDDEN_SIZES
@@ -207,9 +210,14 @@ class GateLinear(ReplicatedLinear):
             output = bf16x3_router_gemm(x, self.weight)
             return output, None
 
-        # Tier 5: cuBLAS bf16→fp32
+        # Tier 5: bf16→fp32 (aiter tuned gemm on ROCm, cuBLAS elsewhere)
         if self.allow_cublas_router_gemm and x.dtype == torch.bfloat16:
-            output = torch.mm(x, self.weight.T, out_dtype=torch.float32)
+            if current_platform.is_rocm():
+                from aiter.tuned_gemm import tgemm
+
+                output = tgemm.mm(x, self.weight, otype=torch.float32)
+            else:
+                output = torch.mm(x, self.weight.T, out_dtype=torch.float32)
             return output, None
 
         # Tier 6: F.linear (ReplicatedLinear)

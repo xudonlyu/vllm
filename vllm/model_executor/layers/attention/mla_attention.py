@@ -512,6 +512,14 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
 
+        # Whether this impl provides the dense-MHA prefill path.
+        # MLAAttentionImpl.forward_mha is a `raise NotImplementedError` stub, so
+        # an impl that only overrides forward_mqa must stay on the MQA path.
+        # Resolved once here to keep the check out of the torch.compile graph.
+        self._impl_supports_mha_prefill = (
+            type(self.impl).forward_mha is not MLAAttentionImpl.forward_mha
+        )
+
         self.prefill_backend: MLAPrefillBackend | None
         try:
             prefill_backend_cls = get_mla_prefill_backend(vllm_config)
@@ -827,6 +835,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             prefill_max_seq_len = attn_metadata.prefill_max_seq_len  # type: ignore[attr-defined]
             use_mha = (
                 self.prefill_backend is not None
+                and self._impl_supports_mha_prefill
                 and prefill_max_seq_len <= attn_metadata.topk_tokens  # type: ignore[attr-defined]
                 and not self._vllm_config.attention_config.sparse_mla_force_mqa
             )

@@ -30,6 +30,7 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.mla.rocm_aiter_mla import (
     AiterMLAHelper,
 )
+from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -333,6 +334,13 @@ class ROCMAiterMLASparseMetadata(AttentionMetadata):
     block_size: int = 1
     topk_tokens: int = 2048
 
+    # Read by MLAAttention.forward_impl to split the batch into its MQA and
+    # dense-MHA parts.
+    num_decodes: int = 0
+    num_prefills: int = 0
+    num_decode_tokens: int = 0
+    prefill_max_seq_len: int = 0
+
     # Persistent MLA metadata (only populated when persistent mode is enabled,
     # i.e. when the aiter sparse decode kernel supports work-stealing splits).
     work_meta_data: torch.Tensor | None = None
@@ -592,7 +600,23 @@ class ROCMAiterMLASparseMetadataBuilder(
             torch.cuda.current_stream(self.device).synchronize()
             self._prev_metadata_key = metadata_key
 
+        num_decodes, num_prefills, num_decode_tokens, _ = split_decodes_and_prefills(
+            common_attn_metadata,
+            decode_threshold=self.reorder_batch_threshold or 1,
+        )
+        prefill_max_seq_len = 0
+        if num_prefills > 0:
+            seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
+            if seq_lens_cpu is not None:
+                prefill_max_seq_len = int(
+                    seq_lens_cpu[num_decodes : num_decodes + num_prefills].max().item()
+                )
+
         metadata = ROCMAiterMLASparseMetadata(
+            num_decodes=num_decodes,
+            num_prefills=num_prefills,
+            num_decode_tokens=num_decode_tokens,
+            prefill_max_seq_len=prefill_max_seq_len,
             num_reqs=common_attn_metadata.num_reqs,
             max_query_len=common_attn_metadata.max_query_len,
             max_seq_len=common_attn_metadata.max_seq_len,

@@ -425,6 +425,11 @@ def get_and_maybe_dequant_weights(
     ):
         return weight.to(out_dtype)
 
+    # bpreshuffle stores layer.weight in the shuffled (16,16) layout, which
+    # scaled_dequantize can't interpret; fall through to the identity-matmul path.
+    _fp8_linear = getattr(layer.quant_method, "fp8_linear", None)
+    _is_preshuffled = getattr(_fp8_linear, "use_preshuffle", False)
+
     # Simple Fp8 case: rescale with tensor or block weight scales
     if (
         isinstance(
@@ -434,6 +439,7 @@ def get_and_maybe_dequant_weights(
         # DeepGEMM transforms the scales using `transform_sf_into_required_layout` into
         # a layout that is not compatible with `scaled_dequantize`.
         and not layer.quant_method.use_deep_gemm
+        and not _is_preshuffled
     ):
         weight_scales = get_attribute_fallback(
             layer, ["weight_scale", "weight_scale_inv"]

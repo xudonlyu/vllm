@@ -4,6 +4,7 @@
 
 import torch
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import (
     rocm_aiter_ops,
@@ -370,8 +371,13 @@ class AiterFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         super().__init__(config)
         n, k = config.weight_shape
 
+        self.use_preshuffle = envs.VLLM_ROCM_FP8_BLOCKSCALE_PRESHUFFLE
+        # The preshuffle path quantizes the activation itself (with a
+        # column-major scale), so skip the shared input quantization.
+        self.apply_input_quant = not self.use_preshuffle
         self.use_triton = (
-            not current_platform.is_fp8_fnuz()
+            not self.use_preshuffle
+            and not current_platform.is_fp8_fnuz()
             and rocm_aiter_ops.is_triton_gemm_w8a8_tuned(n, k)
         )
 
@@ -398,6 +404,18 @@ class AiterFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
             )
         return True, None
 
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        super().process_weights_after_loading(layer)
+        if not self.use_preshuffle:
+            return
+        params = self._get_layer_params(layer)
+        w = getattr(layer, params.WEIGHT)
+        replace_parameter(
+            layer,
+            params.WEIGHT,
+            rocm_aiter_ops.shuffle_weight(w.data, layout=(16, 16)),
+        )
+
     def apply_block_scaled_mm(
         self,
         A: torch.Tensor,
@@ -405,6 +423,15 @@ class AiterFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         As: torch.Tensor,
         Bs: torch.Tensor,
     ) -> torch.Tensor:
+        out_dtype = self.config.out_dtype
+        if self.use_preshuffle:
+            # A is the unquantized input; quantize it with a column-major
+            # activation scale, as the bpreshuffle kernel expects.
+            A, As = rocm_aiter_ops.per_1x128_group_quant(A, transpose_scale=True)
+            return rocm_aiter_ops.gemm_a8w8_blockscale_bpreshuffle(
+                A, B, As, Bs, list(self.weight_group_shape), output_dtype=out_dtype
+            )
+
         if As.dtype != Bs.dtype:
             from vllm.model_executor.layers.quantization.utils.fp8_utils import (
                 _upcast_e8m0_to_fp32,
@@ -420,7 +447,6 @@ class AiterFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
             else:
                 Bs = Bs.to(torch.float32)
 
-        out_dtype = self.config.out_dtype
         if self.use_triton:
             gemm_a8w8_blockscale_op = rocm_aiter_ops.triton_gemm_a8w8_blockscale
         else:

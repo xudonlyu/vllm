@@ -708,6 +708,52 @@ def _rocm_aiter_gemm_a8w8_blockscale_fake(
     return Y
 
 
+def _rocm_aiter_gemm_a8w8_blockscale_bpreshuffle_impl(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    output_dtype: torch.dtype = torch.float16,
+) -> torch.Tensor:
+    from aiter import gemm_a8w8_blockscale_bpreshuffle
+
+    return gemm_a8w8_blockscale_bpreshuffle(A, B, As, Bs, dtype=output_dtype)
+
+
+def _rocm_aiter_gemm_a8w8_blockscale_bpreshuffle_fake(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    output_dtype: torch.dtype = torch.float16,
+) -> torch.Tensor:
+    m = A.shape[0]
+    n = B.shape[0]
+    Y = torch.empty(m, n, dtype=output_dtype, device=A.device)
+    return Y
+
+
+def _rocm_aiter_per_1x128_group_quant_impl(
+    x: torch.Tensor,
+    transpose_scale: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from aiter.ops.quant import per_group_quant_hip
+
+    return per_group_quant_hip(
+        x, quant_dtype=FP8_DTYPE, group_size=128, transpose_scale=transpose_scale
+    )
+
+
+def _rocm_aiter_per_1x128_group_quant_fake(
+    x: torch.Tensor,
+    transpose_scale: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    m, k = x.shape
+    y = torch.empty((m, k), dtype=FP8_DTYPE, device=x.device)
+    scale = torch.empty((m, k // 128), dtype=torch.float32, device=x.device)
+    return y, scale
+
+
 def _rocm_aiter_rmsnorm_fused_add_dynamic_quant_impl(
     x: torch.Tensor,
     residual: torch.Tensor,
@@ -1943,6 +1989,19 @@ class rocm_aiter_ops:
             )
 
             direct_register_custom_op(
+                op_name="rocm_aiter_gemm_a8w8_blockscale_bpreshuffle",
+                op_func=_rocm_aiter_gemm_a8w8_blockscale_bpreshuffle_impl,
+                fake_impl=_rocm_aiter_gemm_a8w8_blockscale_bpreshuffle_fake,
+            )
+
+            direct_register_custom_op(
+                op_name="rocm_aiter_per_1x128_group_quant",
+                op_func=_rocm_aiter_per_1x128_group_quant_impl,
+                fake_impl=_rocm_aiter_per_1x128_group_quant_fake,
+                dispatch_key=current_platform.dispatch_key,
+            )
+
+            direct_register_custom_op(
                 op_name="rocm_aiter_rmsnorm_fused_dynamic_quant",
                 op_func=_rocm_aiter_rmsnorm_fused_dynamic_quant_impl,
                 fake_impl=_rocm_aiter_rmsnorm_fused_dynamic_quant_fake,
@@ -2187,6 +2246,26 @@ class rocm_aiter_ops:
         return torch.ops.vllm.rocm_aiter_gemm_a8w8_blockscale(
             A, B, As, Bs, output_dtype
         )
+
+    @staticmethod
+    def gemm_a8w8_blockscale_bpreshuffle(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        As: torch.Tensor,
+        Bs: torch.Tensor,
+        block_size: list[int],
+        output_dtype: torch.dtype = torch.float16,
+    ) -> torch.Tensor:
+        return torch.ops.vllm.rocm_aiter_gemm_a8w8_blockscale_bpreshuffle(
+            A, B, As, Bs, output_dtype
+        )
+
+    @staticmethod
+    def per_1x128_group_quant(
+        x: torch.Tensor,
+        transpose_scale: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return torch.ops.vllm.rocm_aiter_per_1x128_group_quant(x, transpose_scale)
 
     @staticmethod
     def fused_moe(

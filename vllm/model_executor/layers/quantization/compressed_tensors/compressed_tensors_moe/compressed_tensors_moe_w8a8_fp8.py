@@ -318,12 +318,22 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             w2_input_scale=w2_input_scale,
         )
 
+        # Carry the preshuffle marker across replace_parameter so AITER's
+        # fused_moe selects the preshuffled kernel.
+        w13_is_shuffled = getattr(w13, "is_shuffled", False)
+        w2_is_shuffled = getattr(w2, "is_shuffled", False)
+
         # Replace parameters with updated versions. Note that this helper
         # function ensures the replacement is compatible with RL weight reloads.
         replace_parameter(layer, "w13_weight", w13)
         replace_parameter(layer, "w2_weight", w2)
         replace_parameter(layer, "w13_weight_scale", w13_scale)
         replace_parameter(layer, "w2_weight_scale", w2_scale)
+
+        if w13_is_shuffled:
+            layer.w13_weight.is_shuffled = True
+        if w2_is_shuffled:
+            layer.w2_weight.is_shuffled = True
 
         # Setup modular kernel for TP case and naive DP/EP case.
         # In non-naive DP/EP case, we will create a ModularKernelMethod.

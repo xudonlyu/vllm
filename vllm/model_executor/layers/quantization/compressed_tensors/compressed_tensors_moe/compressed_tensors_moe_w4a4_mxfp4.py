@@ -35,7 +35,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
 from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
     prepare_moe_fp4_layer_for_marlin,
 )
-from vllm.model_executor.utils import set_weight_attrs
+from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
@@ -52,6 +52,16 @@ class CompressedTensorsW4A4Mxfp4MoEMethod(CompressedTensorsMoEMethod):
         if self.use_cutlass_mxfp4:
             logger.info_once("Using CutlassExpertsMxfp4 for MXFP4 MoE")
             self.experts_cls = CutlassExpertsMxfp4
+        elif current_platform.is_rocm():
+            # W4A4 MXFP4 MoE on the AITER CK kernel (MXFP4 weights + dynamic
+            # per-group-32 MXFP4 activations).
+            from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (
+                AiterExperts,
+            )
+
+            self.mxfp4_backend = Mxfp4MoeBackend.AITER_MXFP4_MXFP4
+            self.experts_cls = AiterExperts
+            logger.info_once("Using AiterExperts for MXFP4 W4A4 MoE on ROCm platform")
         elif current_platform.is_xpu():
             self.mxfp4_backend = Mxfp4MoeBackend.XPU
             self.experts_cls = XPUExpertsMxFp4
@@ -188,6 +198,42 @@ class CompressedTensorsW4A4Mxfp4MoEMethod(CompressedTensorsMoEMethod):
             layer.w2_weight_scale = torch.nn.Parameter(
                 torch.stack(swizzled_w2), requires_grad=False
             )
+        elif current_platform.is_rocm():
+            # Shuffle fp4 weights and group scales into the AITER CK layout
+            # (gate/up separated).
+            from aiter.ops.shuffle import shuffle_scale, shuffle_weight
+
+            E = layer.w13_weight_scale.shape[0]
+            w13 = shuffle_weight(
+                layer.w13_weight.data.view(torch.float4_e2m1fn_x2),
+                is_guinterleave=False,
+                gate_up=True,
+            )
+            w2 = shuffle_weight(
+                layer.w2_weight.data.view(torch.float4_e2m1fn_x2),
+                is_guinterleave=False,
+                gate_up=False,
+            )
+            w13_scale = shuffle_scale(
+                layer.w13_weight_scale.reshape(-1, layer.w13_weight_scale.shape[-1]),
+                E,
+                is_guinterleave=False,
+                gate_up=True,
+            )
+            w2_scale = shuffle_scale(
+                layer.w2_weight_scale.reshape(-1, layer.w2_weight_scale.shape[-1]),
+                E,
+                is_guinterleave=False,
+                gate_up=False,
+            )
+            replace_parameter(layer, "w13_weight", w13)
+            replace_parameter(layer, "w2_weight", w2)
+            replace_parameter(layer, "w13_weight_scale", w13_scale)
+            replace_parameter(layer, "w2_weight_scale", w2_scale)
+            # Mark the weights so AITER's fused_moe selects the preshuffled
+            # CK kernel.
+            layer.w13_weight.is_shuffled = True
+            layer.w2_weight.is_shuffled = True
         elif current_platform.is_xpu():
             pass
         else:

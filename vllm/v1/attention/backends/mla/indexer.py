@@ -620,7 +620,10 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             prefill_query_lens_cpu = torch.diff(
                 query_start_loc_cpu[num_decodes : num_decodes + num_prefills + 1]
             )
-            max_logits_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
+            # 0 disables logits-based row slicing (chunks bounded only by the
+            # workspace size); otherwise bound the buffer to the configured MB.
+            _logits_mb = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB
+            max_logits_bytes = (_logits_mb * 1024 * 1024) if _logits_mb else (1 << 62)
             # Upper bound is exact for prefill rows (the `[num_decodes:]`
             # slice below).
             assert common_attn_metadata.seq_lens_cpu_upper_bound is not None

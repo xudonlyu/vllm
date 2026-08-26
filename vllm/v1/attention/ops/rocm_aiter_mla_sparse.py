@@ -780,16 +780,36 @@ def rocm_aiter_sparse_attn_indexer(
 
             num_rows = logits.shape[0]
 
-            torch.ops._C.top_k_per_row_prefill(
-                logits,
-                chunk.cu_seqlen_ks,
-                chunk.cu_seqlen_ke,
-                topk_indices,
-                num_rows,
-                logits.stride(0),
-                logits.stride(1),
-                topk_tokens,
-            )
+            # Opt-in asm-fast per-row top-k. The asm kernel only implements
+            # topK in {512, 1024, 2048}; any other K uses the vLLM kernel.
+            if (
+                envs.VLLM_USE_AITER_INDEXER_TOPK_FAST_PREFILL
+                and topk_tokens in (512, 1024, 2048)
+            ):
+                from aiter.ops.topk import top_k_per_row_prefill_fast_with_topk
+
+                top_k_per_row_prefill_fast_with_topk(
+                    logits,
+                    chunk.cu_seqlen_ks,
+                    chunk.cu_seqlen_ke,
+                    topk_indices,
+                    None,
+                    num_rows,
+                    logits.stride(0),
+                    logits.stride(1),
+                    topk_tokens,
+                )
+            else:
+                torch.ops._C.top_k_per_row_prefill(
+                    logits,
+                    chunk.cu_seqlen_ks,
+                    chunk.cu_seqlen_ke,
+                    topk_indices,
+                    num_rows,
+                    logits.stride(0),
+                    logits.stride(1),
+                    topk_tokens,
+                )
 
     if has_decode:
         decode_metadata = layer_attn_metadata.decode
@@ -829,16 +849,35 @@ def rocm_aiter_sparse_attn_indexer(
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
         num_rows = logits.shape[0]
 
-        torch.ops._C.top_k_per_row_decode(
-            logits,
-            next_n,
-            decode_metadata.seq_lens,
-            topk_indices,
-            num_rows,
-            logits.stride(0),
-            logits.stride(1),
-            topk_tokens,
-        )
+        # Opt-in asm-fast per-row top-k. The asm kernel only implements
+        # topK in {512, 1024, 2048}; any other K uses the vLLM kernel.
+        if (
+            envs.VLLM_USE_AITER_INDEXER_TOPK_FAST_DECODE
+            and topk_tokens in (512, 1024, 2048)
+        ):
+            from aiter.ops.topk import top_k_per_row_decode_fast_with_topk
+
+            top_k_per_row_decode_fast_with_topk(
+                logits,
+                next_n,
+                decode_metadata.seq_lens,
+                topk_indices,
+                num_rows,
+                logits.stride(0),
+                logits.stride(1),
+                topk_tokens,
+            )
+        else:
+            torch.ops._C.top_k_per_row_decode(
+                logits,
+                next_n,
+                decode_metadata.seq_lens,
+                topk_indices,
+                num_rows,
+                logits.stride(0),
+                logits.stride(1),
+                topk_tokens,
+            )
 
         if decode_metadata.requires_padding:
             # if padded, we need to unpack

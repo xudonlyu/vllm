@@ -136,6 +136,8 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_RMSNORM: bool = True
     VLLM_ROCM_USE_AITER_MLA: bool = True
     VLLM_ROCM_USE_AITER_MHA: bool = True
+    VLLM_USE_AITER_INDEXER_TOPK_FAST_PREFILL: bool = False
+    VLLM_USE_AITER_INDEXER_TOPK_FAST_DECODE: bool = False
     VLLM_ROCM_USE_AITER_FP4_ASM_GEMM: bool = False
     VLLM_ROCM_USE_AITER_TRITON_ROPE: bool = False
     VLLM_ROCM_USE_AITER_FP8BMM: bool = True
@@ -1243,6 +1245,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # By default is enabled.
     "VLLM_ROCM_USE_AITER_MHA": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_MHA", "True").lower() in ("true", "1")
+    ),
+    # AITER asm-fast per-row top-k for the DSA indexer prefill path.
+    "VLLM_USE_AITER_INDEXER_TOPK_FAST_PREFILL": lambda: (
+        os.getenv("VLLM_USE_AITER_INDEXER_TOPK_FAST_PREFILL", "False").lower()
+        in ("true", "1")
+    ),
+    # AITER asm-fast per-row top-k for the DSA indexer decode path.
+    "VLLM_USE_AITER_INDEXER_TOPK_FAST_DECODE": lambda: (
+        os.getenv("VLLM_USE_AITER_INDEXER_TOPK_FAST_DECODE", "False").lower()
+        in ("true", "1")
     ),
     # Whether to use aiter fp4 gemm asm.
     # By default is disabled.

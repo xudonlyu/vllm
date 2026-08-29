@@ -138,6 +138,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_MHA: bool = True
     VLLM_USE_AITER_INDEXER_TOPK_FAST_PREFILL: bool = False
     VLLM_USE_AITER_INDEXER_TOPK_FAST_DECODE: bool = False
+    VLLM_ROCM_USE_AITER_MOE_A4W4: bool = False
     VLLM_ROCM_USE_AITER_FP4_ASM_GEMM: bool = False
     VLLM_ROCM_USE_AITER_TRITON_ROPE: bool = False
     VLLM_ROCM_USE_AITER_FP8BMM: bool = True
@@ -1245,6 +1246,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # By default is enabled.
     "VLLM_ROCM_USE_AITER_MHA": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_MHA", "True").lower() in ("true", "1")
+    ),
+    # Keep MXFP4 MoE on 4-bit activations instead of 8-bit. Note that aiter
+    # falls back to bf16 below AITER_BF16_FP8_MOE_BOUND, so activation width
+    # varies with batch size unless that bound is pinned.
+    "VLLM_ROCM_USE_AITER_MOE_A4W4": lambda: (
+        os.getenv("VLLM_ROCM_USE_AITER_MOE_A4W4", "False").lower() in ("true", "1")
     ),
     # AITER asm-fast per-row top-k for the DSA indexer prefill path.
     "VLLM_USE_AITER_INDEXER_TOPK_FAST_PREFILL": lambda: (

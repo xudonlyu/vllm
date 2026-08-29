@@ -4,6 +4,7 @@
 
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
@@ -53,15 +54,23 @@ class CompressedTensorsW4A4Mxfp4MoEMethod(CompressedTensorsMoEMethod):
             logger.info_once("Using CutlassExpertsMxfp4 for MXFP4 MoE")
             self.experts_cls = CutlassExpertsMxfp4
         elif current_platform.is_rocm():
-            # W4A4 MXFP4 MoE on the AITER CK kernel (MXFP4 weights + dynamic
-            # per-group-32 MXFP4 activations).
             from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (
                 AiterExperts,
             )
 
-            self.mxfp4_backend = Mxfp4MoeBackend.AITER_MXFP4_MXFP4
+            # Same weights on disk; the gate/up interleave is what selects
+            # the activation width. Interleaved (W4A16) makes aiter quantise
+            # activations to MXFP8 -> a8w4; blocked (W4A4) keeps them fp4.
+            self.mxfp4_backend = (
+                Mxfp4MoeBackend.AITER_MXFP4_MXFP4
+                if envs.VLLM_ROCM_USE_AITER_MOE_A4W4
+                else Mxfp4MoeBackend.AITER_MXFP4_BF16
+            )
             self.experts_cls = AiterExperts
-            logger.info_once("Using AiterExperts for MXFP4 W4A4 MoE on ROCm platform")
+            logger.info_once(
+                "Using AiterExperts for MXFP4 MoE on ROCm (%s)",
+                self.mxfp4_backend.value,
+            )
         elif current_platform.is_xpu():
             self.mxfp4_backend = Mxfp4MoeBackend.XPU
             self.experts_cls = XPUExpertsMxFp4
@@ -199,31 +208,49 @@ class CompressedTensorsW4A4Mxfp4MoEMethod(CompressedTensorsMoEMethod):
                 torch.stack(swizzled_w2), requires_grad=False
             )
         elif current_platform.is_rocm():
-            # Shuffle fp4 weights and group scales into the AITER CK layout
-            # (gate/up separated).
+            # Shuffle fp4 weights and group scales into the AITER layout.
+            # Only w13 is affected: is_guinterleave=False ignores gate_up.
             from aiter.ops.shuffle import shuffle_scale, shuffle_weight
 
+            gu = self.mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_BF16
+
             E = layer.w13_weight_scale.shape[0]
+            if gu:
+                # Required by the interleaved scale reshape.
+                inter = layer.w2_weight_scale.shape[-1] * self.group_size
+                hidden = layer.w13_weight_scale.shape[-1] * self.group_size
+                if inter % 256 != 0 or hidden % 256 != 0:
+                    # Default path, so degrade instead of refusing to start.
+                    logger.warning_once(
+                        "MXFP4 MoE falling back to a4w4: the gate/up-interleaved "
+                        "layout needs intermediate_size_per_partition %% 256 == 0 "
+                        "and hidden_size %% 256 == 0, got %d and %d.",
+                        inter,
+                        hidden,
+                    )
+                    self.mxfp4_backend = Mxfp4MoeBackend.AITER_MXFP4_MXFP4
+                    gu = False
+
             w13 = shuffle_weight(
                 layer.w13_weight.data.view(torch.float4_e2m1fn_x2),
-                is_guinterleave=False,
-                gate_up=True,
+                is_guinterleave=gu,
+                gate_up=gu,
             )
             w2 = shuffle_weight(
                 layer.w2_weight.data.view(torch.float4_e2m1fn_x2),
-                is_guinterleave=False,
+                is_guinterleave=gu,
                 gate_up=False,
             )
             w13_scale = shuffle_scale(
                 layer.w13_weight_scale.reshape(-1, layer.w13_weight_scale.shape[-1]),
                 E,
-                is_guinterleave=False,
-                gate_up=True,
+                is_guinterleave=gu,
+                gate_up=gu,
             )
             w2_scale = shuffle_scale(
                 layer.w2_weight_scale.reshape(-1, layer.w2_weight_scale.shape[-1]),
                 E,
-                is_guinterleave=False,
+                is_guinterleave=gu,
                 gate_up=False,
             )
             replace_parameter(layer, "w13_weight", w13)
@@ -231,9 +258,12 @@ class CompressedTensorsW4A4Mxfp4MoEMethod(CompressedTensorsMoEMethod):
             replace_parameter(layer, "w13_weight_scale", w13_scale)
             replace_parameter(layer, "w2_weight_scale", w2_scale)
             # Mark the weights so AITER's fused_moe selects the preshuffled
-            # CK kernel.
+            # kernel; replace_parameter above drops the attribute.
             layer.w13_weight.is_shuffled = True
             layer.w2_weight.is_shuffled = True
+            logger.info_once(
+                "AITER MXFP4 MoE weights preshuffled, gate/up interleaved=%s", gu
+            )
         elif current_platform.is_xpu():
             pass
         else:

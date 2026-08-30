@@ -110,7 +110,6 @@ from .utils import (
     get_pp_missing_layer_names,
     get_spec_layer_idx_from_weight_name,
     is_pp_missing_parameter,
-    make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
 )
@@ -1343,6 +1342,16 @@ class DeepseekV2DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+def _dsa_skips_topk(config, layer_id: int) -> bool:
+    """Mirrors the skip predicate in DeepseekV2AttentionBase.__init__."""
+    pattern = getattr(config, "index_topk_pattern", None)
+    if pattern is not None:
+        return 0 <= layer_id < len(pattern) and pattern[layer_id] == "S"
+    freq = getattr(config, "index_topk_freq", 1)
+    offset = getattr(config, "index_skip_topk_offset", 2)
+    return max(layer_id - offset + 1, 0) % freq != 0
+
+
 @support_torch_compile
 class DeepseekV2Model(nn.Module):
     fall_back_to_pt_during_load = False
@@ -1367,6 +1376,9 @@ class DeepseekV2Model(nn.Module):
             )
         else:
             topk_indices_buffer = None
+        # Not named `topk_indices_buffer`: that name activates a spec-decode
+        # rebinding (eagle/utils.py) which cannot reach the attention impl.
+        self._dsa_topk_buffer = topk_indices_buffer
 
         if get_pp_group().is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -1391,8 +1403,16 @@ class DeepseekV2Model(nn.Module):
             self.norm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
-        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-            ["hidden_states", "residual"], self.hidden_size
+        pp = get_pp_group()
+        self._dsa_recv_index = (
+            self._dsa_topk_buffer is not None
+            and not pp.is_first_rank
+            and _dsa_skips_topk(config, self.start_layer)
+        )
+        self._dsa_send_index = (
+            self._dsa_topk_buffer is not None
+            and not pp.is_last_rank
+            and _dsa_skips_topk(config, self.end_layer)
         )
 
         self.aux_hidden_state_layers = tuple[int, ...]()
@@ -1409,6 +1429,26 @@ class DeepseekV2Model(nn.Module):
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
+
+    def make_empty_intermediate_tensors(
+        self, batch_size: int, dtype: torch.dtype, device: torch.device
+    ) -> IntermediateTensors:
+        """Overridden: the shared factory cannot express the int32 index tensor."""
+        tensors = {
+            "hidden_states": torch.zeros(
+                (batch_size, self.hidden_size), dtype=dtype, device=device
+            ),
+            "residual": torch.zeros(
+                (batch_size, self.hidden_size), dtype=dtype, device=device
+            ),
+        }
+        if self._dsa_recv_index:
+            tensors["index_topk"] = torch.zeros(
+                (batch_size, self.config.index_topk),
+                dtype=torch.int32,
+                device=device,
+            )
+        return IntermediateTensors(tensors)
 
     def forward(
         self,
@@ -1432,6 +1472,9 @@ class DeepseekV2Model(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
+            if self._dsa_recv_index:
+                index_topk = intermediate_tensors["index_topk"]
+                self._dsa_topk_buffer[: index_topk.shape[0]].copy_(index_topk)
 
         # Compute llama 4 scaling once per forward pass if enabled
         llama_4_scaling_config = getattr(self.config, "llama_4_scaling", None)
@@ -1478,9 +1521,11 @@ class DeepseekV2Model(nn.Module):
             )
 
         if not get_pp_group().is_last_rank:
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
+            tensors = {"hidden_states": hidden_states, "residual": residual}
+            if self._dsa_send_index:
+                # positions: hidden_states may be SP-scattered; needs replicated indexer
+                tensors["index_topk"] = self._dsa_topk_buffer[: positions.shape[0]]
+            return IntermediateTensors(tensors)
 
         if hidden_states.shape[0] != positions.shape[0]:
             combined_states = torch.cat([hidden_states, residual], dim=-1)

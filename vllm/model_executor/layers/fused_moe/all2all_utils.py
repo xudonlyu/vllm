@@ -316,6 +316,7 @@ def maybe_make_prepare_finalize(
             max_tokens_per_rank=moe.max_num_tokens,
             num_dispatchers=all2all_manager.world_size,
             use_fp8_dispatch=use_fp8_dispatch,
+            compact_recv_layout=not all2all_manager.internode,
         )
 
     elif moe.use_fi_nvl_two_sided_kernels:

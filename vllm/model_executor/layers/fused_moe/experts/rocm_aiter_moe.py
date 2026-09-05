@@ -56,6 +56,23 @@ class ActivationMethod(IntEnum):
 aiter_topK_meta_data: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
+def _has_fake_expert_slot(
+    topk_ids: torch.Tensor,
+    expert_mask: torch.Tensor | None,
+    global_num_experts: int,
+    experts_per_token: int,
+) -> bool:
+    """Whether AITER's top-k inputs contain its trailing fake expert slot."""
+    if expert_mask is None:
+        return False
+
+    extra_expert_mask_entries = expert_mask.numel() - global_num_experts
+    extra_topk_slots = topk_ids.shape[-1] - experts_per_token
+    return bool(
+        extra_expert_mask_entries > 0 and extra_expert_mask_entries == extra_topk_slots
+    )
+
+
 @lru_cache(maxsize=1)
 def init_aiter_topK_meta_data(
     n_routed_experts: int,
@@ -414,6 +431,12 @@ def rocm_aiter_fused_experts(
             moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
             beta=moe_config.activation_situ_beta,
             linear_beta=moe_config.activation_situ_linear_beta,
+            has_fake_expert_slot=_has_fake_expert_slot(
+                topk_ids,
+                expert_mask,
+                global_num_experts=moe_config.num_experts,
+                experts_per_token=moe_config.experts_per_token,
+            ),
         )
 
 

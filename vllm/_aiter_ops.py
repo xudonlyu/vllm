@@ -232,6 +232,7 @@ def _rocm_aiter_fused_moe_impl(
     swiglu_limit: float = 0.0,
     beta: float | None = None,
     linear_beta: float | None = None,
+    has_fake_expert_slot: bool = False,
 ) -> torch.Tensor:
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
@@ -242,6 +243,8 @@ def _rocm_aiter_fused_moe_impl(
     extra_kwargs: dict = {}
     if gate_mode and rocm_aiter_ops.fused_moe_supports_gate_mode():
         extra_kwargs["gate_mode"] = gate_mode
+    if rocm_aiter_ops.fused_moe_supports_has_fake_expert_slot():
+        extra_kwargs["has_fake_expert_slot"] = has_fake_expert_slot
     if (
         getattr(ActivationType, "Situv2", None) is not None
         and activation == ActivationType.Situv2
@@ -300,6 +303,7 @@ def _rocm_aiter_fused_moe_fake(
     swiglu_limit: float = 0.0,
     beta: float | None = None,
     linear_beta: float | None = None,
+    has_fake_expert_slot: bool = False,
 ) -> torch.Tensor:
     if output_dtype is not None:
         return torch.empty_like(hidden_states, dtype=output_dtype)
@@ -2046,6 +2050,21 @@ class rocm_aiter_ops:
 
         return "gate_mode" in inspect.signature(fused_moe).parameters
 
+    @classmethod
+    @if_aiter_supported
+    @functools.cache
+    def fused_moe_supports_has_fake_expert_slot(cls) -> bool:
+        """Probe whether AITER accepts ``has_fake_expert_slot``.
+
+        Keep the vLLM custom-op schema stable while remaining compatible with
+        AITER builds that predate the explicit fake-expert-slot argument.
+        """
+        import inspect
+
+        from aiter.fused_moe import fused_moe
+
+        return "has_fake_expert_slot" in inspect.signature(fused_moe).parameters
+
     @staticmethod
     def register_ops_once() -> None:
         global _OPS_REGISTERED
@@ -2497,6 +2516,7 @@ class rocm_aiter_ops:
         swiglu_limit: float = 0.0,
         beta: float | None = None,
         linear_beta: float | None = None,
+        has_fake_expert_slot: bool = False,
     ) -> torch.Tensor:
         return torch.ops.vllm.rocm_aiter_fused_moe(
             hidden_states,
@@ -2523,6 +2543,7 @@ class rocm_aiter_ops:
             swiglu_limit,
             beta,
             linear_beta,
+            has_fake_expert_slot,
         )
 
     @staticmethod

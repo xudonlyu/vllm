@@ -471,6 +471,21 @@ class DeepseekV4DecoderLayer(nn.Module):
     ):
         return self.mhc_post(x, residual, post, comb)
 
+    def _attn_norm_with_quant(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        num_tokens = x.numel() // x.shape[-1]
+        if not self.attn.can_reuse_wqa_wkv_quantization(num_tokens):
+            return self.attn_norm(x), None, None
+
+        x_fp8, x_scale, x_normed = rocm_aiter_ops.rmsnorm_group_fused_quant_with_bf16(
+            x,
+            self.attn_norm.weight.data,
+            self.rms_norm_eps,
+            transpose_scale=True,
+        )
+        return x_normed, x_fp8, x_scale
+
     def _forward_fused_post_pre(
         self,
         x: torch.Tensor,
@@ -502,8 +517,14 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_sinkhorn_iters,
             )
 
-        x = self.attn_norm(x)
-        x = self.attn(positions, x, None)
+        x, x_fp8, x_scale = self._attn_norm_with_quant(x)
+        x = self.attn(
+            positions,
+            x,
+            None,
+            hidden_states_fp8=x_fp8,
+            hidden_states_scale=x_scale,
+        )
 
         residual, post_mix, res_mix, x = self.mhc_fused_post_pre(
             x,
@@ -538,8 +559,14 @@ class DeepseekV4DecoderLayer(nn.Module):
         x, post, comb = self.hc_pre(
             x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
         )
-        x = self.attn_norm(x)
-        x = self.attn(positions, x, None)
+        x, x_fp8, x_scale = self._attn_norm_with_quant(x)
+        x = self.attn(
+            positions,
+            x,
+            None,
+            hidden_states_fp8=x_fp8,
+            hidden_states_scale=x_scale,
+        )
         x = self.hc_post(x, residual, post, comb)
 
         residual = x

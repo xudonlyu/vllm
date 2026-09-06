@@ -363,6 +363,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None = None,
+        hidden_states_fp8: torch.Tensor | None = None,
+        hidden_states_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Pre-allocate attention output with FlashMLA-padded head count.
         # The op writes into `o_padded`; we slice to n_local_heads after.
@@ -376,7 +378,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # Keep the attention input preparation in the captured graph. Only the
         # sparse indexer and MLA attention run in the eager break below.
         qr_kv, kv_score, indexer_kv_score, indexer_weights = (
-            self._run_parallel_input_projections(hidden_states)
+            self._run_parallel_input_projections(
+                hidden_states, hidden_states_fp8, hidden_states_scale
+            )
         )
         qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
         qr, kv = fused_q_kv_rmsnorm(
@@ -510,15 +514,24 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # ColumnParallelLinear with return_bias=False returns the tensor.
         return self.wq_b(qr)
 
-    def _fused_wqa_wkv_gemm(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def _fused_wqa_wkv_gemm(
+        self,
+        hidden_states: torch.Tensor,
+        hidden_states_fp8: torch.Tensor | None = None,
+        hidden_states_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         # Override point: the ROCm layer preshuffles this weight in place, so
         # it cannot go through fused_wqa_wkv directly.
         # MergedColumnParallelLinear returns (output, bias); bias is None.
+        assert hidden_states_fp8 is None and hidden_states_scale is None
         qr_kv, _ = self.fused_wqa_wkv(hidden_states)
         return qr_kv
 
     def _run_parallel_input_projections(
-        self, hidden_states: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        hidden_states_fp8: torch.Tensor | None = None,
+        hidden_states_scale: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor | None,
@@ -568,7 +581,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             aux_fns[2] = indexer_compressor_kv_score
 
         qr_kv, (kv_score, indexer_weights, indexer_kv_score) = execute_in_parallel(
-            lambda: self._fused_wqa_wkv_gemm(hidden_states),
+            lambda: self._fused_wqa_wkv_gemm(
+                hidden_states, hidden_states_fp8, hidden_states_scale
+            ),
             aux_fns,
             self.ln_events[0],
             self.ln_events[1:4],

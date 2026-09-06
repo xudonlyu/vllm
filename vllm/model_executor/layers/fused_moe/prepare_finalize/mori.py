@@ -24,6 +24,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         max_tokens_per_rank: int,
         num_dispatchers: int,
         use_fp8_dispatch: bool = False,
+        mxfp_dispatch_dtype: torch.dtype | None = None,
         compact_recv_layout: bool = False,
     ):
         super().__init__()
@@ -31,6 +32,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         self.num_dispatchers_ = num_dispatchers
         self.max_tokens_per_rank = max_tokens_per_rank
         self.use_fp8_dispatch = use_fp8_dispatch
+        self.mxfp_dispatch_dtype = mxfp_dispatch_dtype
         self.compact_recv_layout = compact_recv_layout
 
     @property
@@ -105,14 +107,44 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         assert not apply_router_weight_on_input, (
             "mori does not support apply_router_weight_on_input=True now."
         )
-        num_tokens = a1.shape[0]
+        num_tokens, hidden_dim = a1.shape
         scale = None
+        if self.mxfp_dispatch_dtype is not None and defer_input_quant:
+            raise ValueError(
+                "MXFP4/MXFP8 dispatch requires the prepare step to quantize activations"
+            )
         # When defer_input_quant is True, the expert kernel handles
-        # quantization internally, so skip FP8 dispatch quantization.
-        if self.use_fp8_dispatch and not defer_input_quant:
-            from aiter import QuantType, get_hip_quant
+        # quantization internally, so skip prepare-side dispatch quantization.
+        if (self.use_fp8_dispatch or self.mxfp_dispatch_dtype is not None) and not (
+            defer_input_quant
+        ):
+            from aiter import QuantType, dtypes, get_hip_quant
 
-            if quant_config.is_block_quantized:
+            if self.mxfp_dispatch_dtype is not None:
+                quant_func = get_hip_quant(QuantType.per_1x32)
+                a1, scale = quant_func(
+                    a1,
+                    quant_dtype=self.mxfp_dispatch_dtype,
+                    scale_type=dtypes.fp8_e8m0,
+                )
+                if not a1.is_contiguous() or not scale.is_contiguous():
+                    raise ValueError("MX dispatch tensors must be contiguous")
+                packed_width = (
+                    hidden_dim // 2
+                    if self.mxfp_dispatch_dtype == dtypes.fp4x2
+                    else hidden_dim
+                )
+                if a1.dtype != self.mxfp_dispatch_dtype or a1.shape != (
+                    num_tokens,
+                    packed_width,
+                ):
+                    raise ValueError("MX dispatch produced an invalid payload layout")
+                if scale.dtype != dtypes.fp8_e8m0 or scale.shape != (
+                    num_tokens,
+                    hidden_dim // 32,
+                ):
+                    raise ValueError("MX dispatch produced an invalid scale layout")
+            elif quant_config.is_block_quantized:
                 quant_func = get_hip_quant(QuantType.per_1x128)
                 a1, scale = quant_func(a1, quant_dtype=current_platform.fp8_dtype())
             elif quant_config.is_per_act_token:

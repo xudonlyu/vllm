@@ -305,9 +305,10 @@ def _rocm_aiter_fused_moe_fake(
     linear_beta: float | None = None,
     has_fake_expert_slot: bool = False,
 ) -> torch.Tensor:
+    output_shape = (*hidden_states.shape[:-1], w2.shape[1])
     if output_dtype is not None:
-        return torch.empty_like(hidden_states, dtype=output_dtype)
-    return torch.empty_like(hidden_states)
+        return hidden_states.new_empty(output_shape, dtype=output_dtype)
+    return hidden_states.new_empty(output_shape)
 
 
 def _rocm_aiter_asm_moe_tkw1_impl(

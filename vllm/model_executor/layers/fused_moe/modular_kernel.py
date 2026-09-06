@@ -1303,7 +1303,7 @@ class FusedMoEKernelModularImpl:
         # low-latency kernels are always batched and can never run into
         # the tensor.numel() == 0 case.
         if M_full == 0:
-            return torch.empty_like(a1q, dtype=in_dtype)
+            return a1q.new_empty((M_full, K), dtype=in_dtype)
 
         workspace13, workspace2, fused_out = self._allocate_buffers(
             in_dtype,

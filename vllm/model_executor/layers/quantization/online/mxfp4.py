@@ -18,13 +18,13 @@ if TYPE_CHECKING:
 
 from vllm.model_executor.kernels.linear import init_mxfp4_linear_kernel
 from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
-    TRITON_BACKENDS,
     Mxfp4MoeBackend,
     convert_weight_to_mxfp4_moe_kernel_format,
     make_mxfp4_moe_kernel,
     make_mxfp4_moe_quant_config,
     mxfp4_round_up_hidden_size_and_intermediate_size,
     select_mxfp4_moe_backend,
+    uses_triton_mxfp4_weight_format,
 )
 from vllm.model_executor.layers.quantization.online.fp8 import (
     _Fp8OnlineLinearBase,
@@ -226,9 +226,7 @@ class Mxfp4OnlineMoEMethod(OnlineMoEMethodBase):
         # Copied from `quark_moe.py`.
         # TODO: This should not be here, replace_parameter should handle
         # triton_kernels.tensor.Tensor.
-        if self.mxfp4_backend in TRITON_BACKENDS or self.mxfp4_backend in (
-            Mxfp4MoeBackend.AITER_MXFP4_FP8,
-        ):
+        if uses_triton_mxfp4_weight_format(self.mxfp4_backend, self.moe):
             # Triton-based backends: w13/w2 are triton_kernels.tensor.Tensor
             # Store on layer for apply(), scales are PrecisionConfig
             layer.w13_weight = w13

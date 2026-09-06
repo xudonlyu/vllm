@@ -115,7 +115,7 @@ class Mxfp4MoeBackend(Enum):
     AITER_MXFP4_BF16 = "AITER_MXFP4_BF16"  # W4A16: CK kernel
     # Keep the legacy name as an alias while the ROCm split backend rename settles.
     AITER = "AITER_MXFP4_BF16"
-    AITER_MXFP4_FP8 = "AITER_MXFP4_FP8"  # W4A8: triton kernel
+    AITER_MXFP4_FP8 = "AITER_MXFP4_FP8"  # W4A8
     AITER_MXFP4_MXFP4 = "AITER_MXFP4_MXFP4"  # W4A4: CK kernel
     # Triton
     TRITON = "TRITON"
@@ -140,6 +140,27 @@ TRITON_BACKENDS = (
     Mxfp4MoeBackend.TRITON,
     Mxfp4MoeBackend.TRITON_UNFUSED,
 )
+
+
+def uses_aiter_mori_a8w4(
+    backend: Mxfp4MoeBackend,
+    moe_config: FusedMoEConfig | None,
+) -> bool:
+    return (
+        backend == Mxfp4MoeBackend.AITER_MXFP4_FP8
+        and moe_config is not None
+        and moe_config.use_mori_kernels
+    )
+
+
+def uses_triton_mxfp4_weight_format(
+    backend: Mxfp4MoeBackend,
+    moe_config: FusedMoEConfig,
+) -> bool:
+    return backend in TRITON_BACKENDS or (
+        backend == Mxfp4MoeBackend.AITER_MXFP4_FP8
+        and not uses_aiter_mori_a8w4(backend, moe_config)
+    )
 
 
 def backend_to_kernel_cls(
@@ -231,8 +252,11 @@ def backend_to_kernel_cls(
         from vllm.model_executor.layers.fused_moe.experts.aiter_mxfp4_w4a8_moe import (
             AiterW4A8ExpertsMonolithic,
         )
+        from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (
+            AiterExperts,
+        )
 
-        return [AiterW4A8ExpertsMonolithic]
+        return [AiterW4A8ExpertsMonolithic, AiterExperts]
 
     elif backend == Mxfp4MoeBackend.AITER_MXFP4_MXFP4:
         from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (
@@ -1023,7 +1047,9 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
             w2_bias,
         )
 
-    elif mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_BF16:
+    elif mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_BF16 or (
+        uses_aiter_mori_a8w4(mxfp4_backend, getattr(layer, "moe_config", None))
+    ):
         from vllm._aiter_ops import rocm_aiter_ops
 
         if w13_bias is not None:
@@ -1459,8 +1485,12 @@ def convert_weight_to_mxfp4_moe_kernel_format(
             w2_bias,
         )
 
-    elif mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_BF16 and not is_gfx1250:
-        # Initially introduced for DeepSeekV4
+    elif (
+        mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_BF16
+        or uses_aiter_mori_a8w4(mxfp4_backend, getattr(layer, "moe_config", None))
+    ) and not is_gfx1250:
+        # A8W4 Mori dispatch uses the same gate/up-interleaved AITER
+        # fused-MoE weight layout as the dynamic A8W4 path.
 
         if w13_bias is not None:
             w13_bias = w13_bias.data.to(torch.float32)
@@ -1471,7 +1501,8 @@ def convert_weight_to_mxfp4_moe_kernel_format(
 
         # TODO: Remove this once AITER is fixed
         # Necessary for AITER side from crashing
-        os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
+        if mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_BF16:
+            os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
 
         if activation == MoEActivation.SITU:
             from aiter.utility.fp4_utils import e8m0_shuffle
@@ -1482,7 +1513,10 @@ def convert_weight_to_mxfp4_moe_kernel_format(
             e8m0_dtype = torch.float8_e8m0fnu
             # a8w4 uses gate/up-interleaved flydsl kernels;
             # default a16w4 keeps the separated layout.
-            guinterleave = rocm_aiter_ops.is_fused_moe_situv2_a8w4_enabled()
+            guinterleave = (
+                uses_aiter_mori_a8w4(mxfp4_backend, getattr(layer, "moe_config", None))
+                or rocm_aiter_ops.is_fused_moe_situv2_a8w4_enabled()
+            )
             w13 = rocm_aiter_ops.shuffle_weight_a16w4(
                 w13_weight.data.view(fp4_dtype), 16, guinterleave
             )
@@ -1674,9 +1708,9 @@ def convert_weight_to_mxfp4_moe_kernel_format(
             w13_bias,
             w2_bias,
         )
-    elif mxfp4_backend in (
-        Mxfp4MoeBackend.AITER_MXFP4_MXFP4,
-        Mxfp4MoeBackend.AITER_MXFP4_FP8,
+    elif mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_MXFP4 or (
+        mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_FP8
+        and not uses_aiter_mori_a8w4(mxfp4_backend, getattr(layer, "moe_config", None))
     ):
         return convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
             mxfp4_backend=mxfp4_backend,

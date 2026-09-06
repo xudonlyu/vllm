@@ -282,28 +282,65 @@ def maybe_make_prepare_finalize(
     elif moe.use_mori_kernels:
         assert quant_config is not None
 
+        mxfp_dispatch_dtype: torch.dtype | None = None
+        if moe.moe_backend == "aiter_mxfp4_fp8":
+            if not quant_config.use_mxfp4_w4a8:
+                raise ValueError("aiter_mxfp4_fp8 requires an MXFP4 W4A8 quant config")
+            from aiter import dtypes
+
+            mxfp_dispatch_dtype = dtypes.fp8
+        elif moe.moe_backend == "aiter_mxfp4_mxfp4":
+            if not quant_config.use_mxfp4_w4a4:
+                raise ValueError(
+                    "aiter_mxfp4_mxfp4 requires an MXFP4 W4A4 quant config"
+                )
+            from aiter import dtypes
+
+            if getattr(torch, "float4_e2m1fn_x2", None) != dtypes.fp4x2:
+                raise NotImplementedError(
+                    "Mori MXFP4 dispatch requires native torch FP4 dtype support"
+                )
+            mxfp_dispatch_dtype = dtypes.fp4x2
+
+        if mxfp_dispatch_dtype is not None:
+            from vllm.platforms.rocm import on_gfx950
+
+            if not on_gfx950():
+                raise NotImplementedError("Mori MXFP4/MXFP8 dispatch requires gfx950")
+            if moe.hidden_dim % 32 != 0:
+                raise ValueError(
+                    "Mori MXFP4/MXFP8 dispatch requires hidden_dim divisible by 32"
+                )
         # Note: We may want to use FP8 dispatch just to reduce
         # data movement.
         use_fp8_dispatch = (
             quant_config.is_per_act_token or quant_config.is_block_quantized
         )
-        if use_fp8_dispatch:
+        if mxfp_dispatch_dtype is not None:
+            quant_dtype = mxfp_dispatch_dtype
+            scale_dim = moe.hidden_dim // 32
+            scale_type_size = 1
+        elif use_fp8_dispatch:
             # For PTPC (per token per channel) quant, scale dim is 1
             # For 1x128 quant, scale dim is hidden_dim // 128
             quant_dtype = quant_config.quant_dtype
             scale_dim = 1 if quant_config.is_per_act_token else moe.hidden_dim // 128
+            scale_type_size = torch.float32.itemsize
         else:
             # Unquantized dispatch (e.g. AITER with defer_input_quant):
             # dispatch raw BF16/FP16 data, no scales needed.
             quant_dtype = moe.in_dtype
             scale_dim = 0
+            scale_type_size = 0
+        # Keep the logical width here. Mori reads the packed FP4 width from the
+        # runtime dispatch tensor while sizing this handle for BF16 combine output.
         all_to_all_args = dict(
             rank=all2all_manager.rank,
             num_ep_ranks=all2all_manager.world_size,
             quant_dtype=quant_dtype,
             token_hidden_size=moe.hidden_dim,
             scale_dim=scale_dim,
-            scale_type_size=0 if scale_dim == 0 else torch.float32.itemsize,
+            scale_type_size=scale_type_size,
             max_num_tokens_per_dp_rank=moe.max_num_tokens,
             input_dtype=moe.in_dtype,
             num_local_experts=moe.num_experts // all2all_manager.world_size,
@@ -316,6 +353,7 @@ def maybe_make_prepare_finalize(
             max_tokens_per_rank=moe.max_num_tokens,
             num_dispatchers=all2all_manager.world_size,
             use_fp8_dispatch=use_fp8_dispatch,
+            mxfp_dispatch_dtype=mxfp_dispatch_dtype,
             compact_recv_layout=not all2all_manager.internode,
         )
 

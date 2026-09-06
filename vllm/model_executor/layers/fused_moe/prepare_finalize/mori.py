@@ -8,6 +8,7 @@ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+from vllm.model_executor.layers.fused_moe.utils import aiter_mx_quantize_input
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
@@ -24,6 +25,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         max_tokens_per_rank: int,
         num_dispatchers: int,
         use_fp8_dispatch: bool = False,
+        mxfp_dispatch_dtype: torch.dtype | None = None,
         compact_recv_layout: bool = False,
     ):
         super().__init__()
@@ -31,6 +33,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         self.num_dispatchers_ = num_dispatchers
         self.max_tokens_per_rank = max_tokens_per_rank
         self.use_fp8_dispatch = use_fp8_dispatch
+        self.mxfp_dispatch_dtype = mxfp_dispatch_dtype
         self.compact_recv_layout = compact_recv_layout
 
     @property
@@ -39,6 +42,10 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
 
     def output_is_reduced(self) -> bool:
         return True
+
+    @property
+    def supports_mx_prequantized_inputs(self) -> bool:
+        return self.mxfp_dispatch_dtype is not None
 
     def num_dispatchers(self):
         return self.num_dispatchers_
@@ -107,15 +114,25 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         )
         num_tokens = a1.shape[0]
         scale = None
+        if self.mxfp_dispatch_dtype is not None and defer_input_quant:
+            raise ValueError(
+                "MXFP4/MXFP8 dispatch requires the prepare step to quantize activations"
+            )
         # When defer_input_quant is True, the expert kernel handles
-        # quantization internally, so skip FP8 dispatch quantization.
-        if self.use_fp8_dispatch and not defer_input_quant:
-            from aiter import QuantType, get_hip_quant
+        # quantization internally, so skip prepare-side dispatch quantization.
+        if (self.use_fp8_dispatch or self.mxfp_dispatch_dtype is not None) and not (
+            defer_input_quant
+        ):
+            if self.mxfp_dispatch_dtype is not None:
+                a1, scale = aiter_mx_quantize_input(a1, self.mxfp_dispatch_dtype)
+            elif quant_config.is_block_quantized:
+                from aiter import QuantType, get_hip_quant
 
-            if quant_config.is_block_quantized:
                 quant_func = get_hip_quant(QuantType.per_1x128)
                 a1, scale = quant_func(a1, quant_dtype=current_platform.fp8_dtype())
             elif quant_config.is_per_act_token:
+                from aiter import QuantType, get_hip_quant
+
                 quant_func = get_hip_quant(QuantType.per_Token)
                 a1, scale = quant_func(a1, quant_dtype=current_platform.fp8_dtype())
 

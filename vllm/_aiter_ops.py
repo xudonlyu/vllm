@@ -1324,6 +1324,41 @@ def _rocm_aiter_clamp_act_mul_fake(
     )
 
 
+def _rocm_aiter_clamp_act_mul_and_fp8_group_quant_impl(
+    x: torch.Tensor,
+    swiglu_limit: float,
+    group_size: int,
+    transpose_scale: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from aiter.ops.triton.fusions.fused_clamp_act_mul import fused_clamp_act_mul
+
+    return fused_clamp_act_mul(
+        x,
+        swiglu_limit=swiglu_limit,
+        activation="silu",
+        dtype_quant=FP8_DTYPE,
+        transpose_scale=transpose_scale,
+        quant_block_size=group_size,
+    )
+
+
+def _rocm_aiter_clamp_act_mul_and_fp8_group_quant_fake(
+    x: torch.Tensor,
+    swiglu_limit: float,
+    group_size: int,
+    transpose_scale: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    M, N = x.shape
+    N_half = N // 2
+    x_fp8 = torch.empty((M, N_half), dtype=FP8_DTYPE, device=x.device)
+    out_bs = torch.empty(
+        (M, (N_half + group_size - 1) // group_size),
+        dtype=torch.float32,
+        device=x.device,
+    )
+    return x_fp8, out_bs
+
+
 def _rocm_aiter_act_mul_and_fp8_group_quant_impl(
     x: torch.Tensor,
     group_size: int,
@@ -2228,6 +2263,12 @@ class rocm_aiter_ops:
             )
 
             direct_register_custom_op(
+                op_name="rocm_aiter_clamp_act_mul_and_fp8_group_quant",
+                op_func=_rocm_aiter_clamp_act_mul_and_fp8_group_quant_impl,
+                fake_impl=_rocm_aiter_clamp_act_mul_and_fp8_group_quant_fake,
+            )
+
+            direct_register_custom_op(
                 op_name="rocm_aiter_act_mul_and_fp8_group_quant",
                 op_func=_rocm_aiter_act_mul_and_fp8_group_quant_impl,
                 fake_impl=_rocm_aiter_act_mul_and_fp8_group_quant_fake,
@@ -2988,6 +3029,17 @@ class rocm_aiter_ops:
     ) -> torch.Tensor:
         """Clamped SwiGLU: silu(clamp(gate)) * clamp(up), fused."""
         return torch.ops.vllm.rocm_aiter_clamp_act_mul(x, swiglu_limit)
+
+    @staticmethod
+    def clamp_act_mul_and_fp8_group_quant(
+        x: torch.Tensor,
+        swiglu_limit: float,
+        group_size: int = 128,
+        transpose_scale: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return torch.ops.vllm.rocm_aiter_clamp_act_mul_and_fp8_group_quant(
+            x, swiglu_limit, group_size, transpose_scale
+        )
 
     @staticmethod
     def group_fp8_quant(

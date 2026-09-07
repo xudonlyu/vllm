@@ -179,6 +179,18 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         """Return whether this instance stores fp8 KV in fp8_ds_mla layout."""
         return self.use_fp8_ds_mla_layout
 
+    def _q_kv_rmsnorm(
+        self, qr: torch.Tensor, kv: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+        qr, kv = fused_q_kv_rmsnorm(
+            qr,
+            kv,
+            self.q_norm.weight.data,
+            self.kv_norm.weight.data,
+            self.eps,
+        )
+        return qr, None, kv
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -379,17 +391,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self._run_parallel_input_projections(hidden_states)
         )
         qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
-        qr, kv = fused_q_kv_rmsnorm(
-            qr,
-            kv,
-            self.q_norm.weight.data,
-            self.kv_norm.weight.data,
-            self.eps,
-        )
+        qr, qr_scale, kv = self._q_kv_rmsnorm(qr, kv)
 
         self._prepare_and_attn_fn(
             hidden_states,
             qr,
+            qr_scale,
             kv,
             kv_score,
             indexer_kv_score,
@@ -407,6 +414,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         self,
         hidden_states: torch.Tensor,
         qr: torch.Tensor,
+        qr_scale: torch.Tensor | None,
         kv: torch.Tensor,
         kv_score: torch.Tensor,
         indexer_kv_score: torch.Tensor,
@@ -422,6 +430,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         self._prepare_and_attn(
             hidden_states,
             qr,
+            qr_scale,
             kv,
             kv_score,
             indexer_kv_score,
@@ -434,6 +443,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         self,
         hidden_states: torch.Tensor,
         qr: torch.Tensor,
+        qr_scale: torch.Tensor | None,
         kv: torch.Tensor,
         kv_score: torch.Tensor,
         indexer_kv_score: torch.Tensor,
@@ -451,7 +461,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         aux_streams = self.aux_stream_list
 
         def project_query_and_cache_kv() -> torch.Tensor:
-            q = self._wq_b_gemm(qr).view(-1, self.n_local_heads, self.head_dim)
+            q = self._wq_b_gemm(qr, qr_scale, kv.dtype).view(
+                -1, self.n_local_heads, self.head_dim
+            )
             return self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
 
         index_q: torch.Tensor | None = None
@@ -469,6 +481,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                     lambda: indexer(
                         hidden_states,
                         qr,
+                        qr_scale,
                         indexer_kv_score,
                         indexer_weights,
                         positions,
@@ -505,9 +518,15 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             o_padded,
         )
 
-    def _wq_b_gemm(self, qr: torch.Tensor) -> torch.Tensor:
+    def _wq_b_gemm(
+        self,
+        qr: torch.Tensor,
+        qr_scale: torch.Tensor | None = None,
+        output_dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
         # Override point, same reason as _fused_wqa_wkv_gemm below.
         # ColumnParallelLinear with return_bias=False returns the tensor.
+        assert qr_scale is None
         return self.wq_b(qr)
 
     def _fused_wqa_wkv_gemm(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -900,7 +919,33 @@ class DeepseekV4Indexer(nn.Module):
             torch.cuda.Event(),
         ]
 
-    def _wq_b_gemm(self, qr: torch.Tensor) -> torch.Tensor:
+    def can_reuse_wq_b_quantization(self, num_tokens: int) -> bool:
+        if self._wq_b_scale is not None:
+            return True
+        return self._wq_b_mxfp8 is not None and self._wq_b_mxfp8.uses_ck_fallback(
+            num_tokens
+        )
+
+    def _wq_b_gemm(
+        self,
+        qr: torch.Tensor,
+        qr_scale: torch.Tensor | None = None,
+        output_dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        if qr_scale is not None:
+            assert output_dtype is not None
+            if self._wq_b_mxfp8 is not None:
+                return self._wq_b_mxfp8.apply_prequantized(qr, qr_scale, output_dtype)
+            assert self._wq_b_scale is not None
+            from vllm._aiter_ops import rocm_aiter_ops
+
+            return rocm_aiter_ops.gemm_a8w8_blockscale_bpreshuffle(
+                qr,
+                self.wq_b.weight,
+                qr_scale,
+                self._wq_b_scale,
+                output_dtype=output_dtype,
+            )
         if self._wq_b_mxfp8 is not None:
             return self._wq_b_mxfp8(qr)
         if self._wq_b_scale is not None and qr.dim() == 2:
@@ -922,6 +967,7 @@ class DeepseekV4Indexer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         qr: torch.Tensor,
+        qr_scale: torch.Tensor | None,
         compressed_kv_score: torch.Tensor,
         indexer_weights: torch.Tensor,
         positions: torch.Tensor,
@@ -956,7 +1002,9 @@ class DeepseekV4Indexer(nn.Module):
                 return None, None, None
 
         def wq_b_and_q_quant():
-            q = self._wq_b_gemm(qr).view(-1, self.n_head, self.head_dim)
+            q = self._wq_b_gemm(qr, qr_scale, hidden_states.dtype).view(
+                -1, self.n_head, self.head_dim
+            )
             outputs = None
             if self.eager_scratch_pool is not None and self.use_fp4_kv:
                 outputs = self.eager_scratch_pool.indexer_q_outputs(q.shape[0])

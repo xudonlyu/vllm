@@ -559,20 +559,84 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
         from vllm._aiter_ops import rocm_aiter_ops
 
         x_fp8, x_scale = rocm_aiter_ops.group_fp8_quant(x, transpose_scale=True)
+        return self._bpre_attn_gemm_quantized(
+            weight, scale, x_fp8, x_scale, x.dtype, reduce_tp
+        )
+
+    def _bpre_attn_gemm_quantized(
+        self,
+        weight: torch.Tensor,
+        scale: torch.Tensor,
+        x_fp8: torch.Tensor,
+        x_scale: torch.Tensor,
+        output_dtype: torch.dtype,
+        reduce_tp: bool = False,
+    ) -> torch.Tensor:
+        from vllm._aiter_ops import rocm_aiter_ops
+
         out = rocm_aiter_ops.gemm_a8w8_blockscale_bpreshuffle(
-            x_fp8, weight, x_scale, scale, output_dtype=x.dtype
+            x_fp8, weight, x_scale, scale, output_dtype=output_dtype
         )
         if reduce_tp and get_tensor_model_parallel_world_size() > 1:
             out = tensor_model_parallel_all_reduce(out)
         return out
 
-    def _wq_b_gemm(self, qr: torch.Tensor) -> torch.Tensor:
+    def _can_reuse_wq_b_quantization(self, num_tokens: int) -> bool:
+        if self._wq_b_scale is not None:
+            return True
+        return self._wq_b_mxfp8 is not None and self._wq_b_mxfp8.uses_ck_fallback(
+            num_tokens
+        )
+
+    def _q_kv_rmsnorm(
+        self, qr: torch.Tensor, kv: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+        if qr.shape[0] == 0:
+            return super()._q_kv_rmsnorm(qr, kv)
+        can_reuse = self._can_reuse_wq_b_quantization(qr.shape[0])
+        if self.indexer is not None:
+            can_reuse = can_reuse and self.indexer.can_reuse_wq_b_quantization(
+                qr.shape[0]
+            )
+        if not can_reuse:
+            return super()._q_kv_rmsnorm(qr, kv)
+
+        from vllm._aiter_ops import rocm_aiter_ops
+
+        q_fp8, q_scale, kv_normed = rocm_aiter_ops.fused_mla_dual_rms_norm_group_quant(
+            qr,
+            self.q_norm.weight.data,
+            kv,
+            self.kv_norm.weight.data,
+            self.eps,
+            self.eps,
+        )
+        return q_fp8, q_scale, kv_normed
+
+    def _wq_b_gemm(
+        self,
+        qr: torch.Tensor,
+        qr_scale: torch.Tensor | None = None,
+        output_dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
         # ColumnParallel -> the sharded output needs no all-reduce.
+        if qr_scale is not None:
+            assert output_dtype is not None
+            if self._wq_b_mxfp8 is not None:
+                return self._wq_b_mxfp8.apply_prequantized(qr, qr_scale, output_dtype)
+            assert self._wq_b_scale is not None
+            return self._bpre_attn_gemm_quantized(
+                self.wq_b.weight,
+                self._wq_b_scale,
+                qr,
+                qr_scale,
+                output_dtype,
+            )
         if self._wq_b_mxfp8 is not None:
             return self._wq_b_mxfp8(qr)
         if self._wq_b_scale is not None and qr.dim() == 2:
             return self._bpre_attn_gemm(self.wq_b.weight, self._wq_b_scale, qr, False)
-        return super()._wq_b_gemm(qr)
+        return super()._wq_b_gemm(qr, qr_scale, output_dtype)
 
     def _fused_wqa_wkv_gemm(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self._wqa_wkv_mxfp8 is not None:

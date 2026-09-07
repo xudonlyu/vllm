@@ -742,6 +742,12 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 else attn_metadata.block_size // self.compress_ratio
             ),
             swa_page_size=swa_metadata.block_size,
+            # This step's actual rows per request, so the adapter can keep a
+            # request's rows on one XCD while dealing requests across them.
+            # Not read from the speculative config: get_current_vllm_config()
+            # is unset at forward time by design, and this is the true value
+            # for the step rather than the configured maximum.
+            num_decodes=num_decodes,
             kv_cache_dtype=self.kv_cache_dtype,
             attn_sink=self.attn_sink,
             softmax_scale=self.scale,

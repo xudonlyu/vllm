@@ -170,6 +170,45 @@ class DeepseekV4MLP(nn.Module):
             )
         else:
             gate_up, _ = self.gate_up_proj(x)
+
+        flat_m = gate_up.numel() // gate_up.shape[-1]
+        down_uses_ck = self._down_scale is not None or (
+            self._down_mxfp8 is not None
+            and self._down_mxfp8.uses_ck_fallback(flat_m)
+        )
+        if down_uses_ck and isinstance(self.act_fn, SiluAndMulWithClamp):
+            gate_up_2d = gate_up.reshape(-1, gate_up.shape[-1])
+            if gate_up_2d.is_contiguous() and self.act_fn._aiter_applies(gate_up_2d):
+                x_fp8, x_scale = rocm_aiter_ops.clamp_act_mul_and_fp8_group_quant(
+                    gate_up_2d,
+                    self.act_fn.swiglu_limit,
+                    transpose_scale=True,
+                )
+                if self._down_mxfp8 is not None:
+                    out = self._down_mxfp8.apply_prequantized(
+                        x_fp8,
+                        x_scale,
+                        gate_up.dtype,
+                        reduce_tp=self._down_reduce,
+                    )
+                else:
+                    assert self._down_scale is not None
+                    out = rocm_aiter_ops.gemm_a8w8_blockscale_bpreshuffle(
+                        x_fp8,
+                        self.down_proj.weight,
+                        x_scale,
+                        self._down_scale,
+                        output_dtype=gate_up.dtype,
+                    )
+                    if (
+                        self._down_reduce
+                        and get_tensor_model_parallel_world_size() > 1
+                    ):
+                        out = tensor_model_parallel_all_reduce(out)
+                if gate_up.dim() != 2:
+                    out = out.view(*gate_up.shape[:-1], out.shape[-1])
+                return out
+
         x = self.act_fn(gate_up)
         if self._down_mxfp8 is not None:
             return self._down_mxfp8(x, reduce_tp=self._down_reduce)

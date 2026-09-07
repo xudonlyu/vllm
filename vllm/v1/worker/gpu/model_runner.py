@@ -1790,16 +1790,29 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             sampled_token_ids=None,  # type: ignore
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
         )
-        # Start async output copy here so that it can overlap with speculator proposal.
-        async_output = AsyncOutput(
-            model_runner_output=model_runner_output,
-            sampler_output=sampler_output,
-            num_sampled_tokens=num_sampled,
-            main_stream=self.main_stream,
-            copy_stream=self.output_copy_stream,
-            check_ep_fault=self.check_ep_fault,
-            routed_experts=routed_experts,
+        defer_output_copy_submission = (
+            torch.version.hip is not None
+            and self.speculative_config is not None
+            and self.speculative_config.use_dspark()
+            and not self.check_ep_fault
         )
+        # ROCm cross-stream waits can block host submission. Record readiness
+        # now, then submit the copy after the draft has been queued.
+        output_ready_event: torch.cuda.Event | None = None
+        async_output: AsyncOutput | None = None
+        if defer_output_copy_submission:
+            output_ready_event = torch.cuda.Event()
+            output_ready_event.record(self.main_stream)
+        else:
+            async_output = AsyncOutput(
+                model_runner_output=model_runner_output,
+                sampler_output=sampler_output,
+                num_sampled_tokens=num_sampled,
+                main_stream=self.main_stream,
+                copy_stream=self.output_copy_stream,
+                check_ep_fault=self.check_ep_fault,
+                routed_experts=routed_experts,
+            )
 
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
         if self.speculator is not None and self.speculator.supports_mm_inputs:
@@ -1813,11 +1826,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 input_batch, draft_lookahead=1
             )
 
-        # Postprocess results and update request states.
-        # NOTE: This is intentionally done after creating the AsyncOutput,
-        # ensuring that `copy_event` is recorded before calling postprocess.
-        # This sequencing may slightly reduce latency as async D2H copy does not
-        # need to wait for the postprocess to finish.
+        # Postprocess results and update request states. The deferred output
+        # copy waits on the readiness event recorded above, not this work.
         self.postprocess_sampled(
             input_batch.idx_mapping,
             sampler_output.sampled_token_ids,
@@ -1853,6 +1863,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     mm_inputs=mm_inputs,
                 )
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+            if defer_output_copy_submission:
+                assert output_ready_event is not None
+                async_output = AsyncOutput(
+                    model_runner_output=model_runner_output,
+                    sampler_output=sampler_output,
+                    num_sampled_tokens=num_sampled,
+                    main_stream=self.main_stream,
+                    copy_stream=self.output_copy_stream,
+                    check_ep_fault=self.check_ep_fault,
+                    routed_experts=routed_experts,
+                    ready_event=output_ready_event,
+                )
             if self.adaptive_verification is not None:
                 self.adaptive_verification.record_confidences(
                     self.speculator.draft_token_confidence_probs, input_batch
@@ -1867,6 +1889,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         # Post-step KV connector related operations.
+        assert async_output is not None
         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
         model_runner_output.kv_connector_output = kv_connector_output
         model_runner_output.ec_connector_output = ec_connector_output

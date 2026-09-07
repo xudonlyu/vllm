@@ -1226,6 +1226,59 @@ def _rocm_aiter_rmsnorm_fp8_group_quant_fake(
     )
 
 
+def _rocm_aiter_rmsnorm_fp8_group_quant_with_bf16_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    variance_epsilon: float,
+    group_size: int,
+    transpose_scale: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    from aiter.ops.fused_qk_rmsnorm_group_quant import (
+        fused_qk_rmsnorm_group_quant,
+    )
+
+    assert x.dim() >= 2
+    n = x.shape[-1]
+    assert n % group_size == 0
+    x_2d = x.reshape(-1, n)
+    m = x_2d.shape[0]
+    x_quant = torch.empty((m, n), dtype=FP8_DTYPE, device=x.device)
+    x_quant_scales = torch.empty(
+        (m, n // group_size), dtype=torch.float32, device=x.device
+    )
+    x_normed_2d = torch.empty((m, n), dtype=x.dtype, device=x.device)
+    if m == 0:
+        return x_quant, x_quant_scales, x_normed_2d.view(x.shape)
+    fused_qk_rmsnorm_group_quant(
+        q_out_quantized=x_quant,
+        q_out_scale=x_quant_scales,
+        q=x_2d,
+        q_weight=weight,
+        q_epsilon=variance_epsilon,
+        q_out_unquantized=x_normed_2d,
+        group_size=group_size,
+        transpose_scale=transpose_scale,
+    )
+    return x_quant, x_quant_scales, x_normed_2d.view(x.shape)
+
+
+def _rocm_aiter_rmsnorm_fp8_group_quant_with_bf16_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    variance_epsilon: float,
+    group_size: int,
+    transpose_scale: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert x.dim() >= 2
+    n = x.shape[-1]
+    m = x.reshape(-1, n).shape[0]
+    return (
+        torch.empty((m, n), dtype=FP8_DTYPE, device=x.device),
+        torch.empty((m, n // group_size), dtype=torch.float32, device=x.device),
+        torch.empty(x.shape, dtype=x.dtype, device=x.device),
+    )
+
+
 def _rocm_aiter_fused_rms_gated_fp8_group_quant_impl(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -2260,6 +2313,12 @@ class rocm_aiter_ops:
             )
 
             direct_register_custom_op(
+                op_name="rocm_aiter_rmsnorm_fp8_group_quant_with_bf16",
+                op_func=_rocm_aiter_rmsnorm_fp8_group_quant_with_bf16_impl,
+                fake_impl=_rocm_aiter_rmsnorm_fp8_group_quant_with_bf16_fake,
+            )
+
+            direct_register_custom_op(
                 op_name="rocm_aiter_fused_rms_gated_fp8_group_quant",
                 op_func=_rocm_aiter_fused_rms_gated_fp8_group_quant_impl,
                 fake_impl=_rocm_aiter_fused_rms_gated_fp8_group_quant_fake,
@@ -2395,6 +2454,26 @@ class rocm_aiter_ops:
     @staticmethod
     def get_rmsnorm_group_fused_quant_op() -> OpOverload:
         return torch.ops.vllm.rocm_aiter_rmsnorm_fp8_group_quant.default
+
+    @staticmethod
+    def get_rmsnorm_group_fused_quant_with_bf16_op() -> OpOverload:
+        return torch.ops.vllm.rocm_aiter_rmsnorm_fp8_group_quant_with_bf16.default
+
+    @staticmethod
+    def rmsnorm_group_fused_quant_with_bf16(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        variance_epsilon: float,
+        group_size: int = 128,
+        transpose_scale: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return torch.ops.vllm.rocm_aiter_rmsnorm_fp8_group_quant_with_bf16(
+            x,
+            weight,
+            variance_epsilon,
+            group_size,
+            transpose_scale,
+        )
 
     @staticmethod
     def get_fused_rms_gated_fp8_group_quant_op() -> OpOverload:

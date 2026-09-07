@@ -638,7 +638,39 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             return self._bpre_attn_gemm(self.wq_b.weight, self._wq_b_scale, qr, False)
         return super()._wq_b_gemm(qr, qr_scale, output_dtype)
 
-    def _fused_wqa_wkv_gemm(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def can_reuse_wqa_wkv_quantization(self, num_tokens: int) -> bool:
+        if self._wqa_wkv_scale is not None:
+            return True
+        return self._wqa_wkv_mxfp8 is not None and self._wqa_wkv_mxfp8.uses_ck_fallback(
+            num_tokens
+        )
+
+    def _fused_wqa_wkv_gemm(
+        self,
+        hidden_states: torch.Tensor,
+        hidden_states_fp8: torch.Tensor | None = None,
+        hidden_states_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if hidden_states_fp8 is not None:
+            assert hidden_states_scale is not None
+            if self._wqa_wkv_mxfp8 is not None:
+                out = self._wqa_wkv_mxfp8.apply_prequantized(
+                    hidden_states_fp8, hidden_states_scale, hidden_states.dtype
+                )
+            else:
+                assert self._wqa_wkv_scale is not None
+                out = self._bpre_attn_gemm_quantized(
+                    self.fused_wqa_wkv.weight,
+                    self._wqa_wkv_scale,
+                    hidden_states_fp8,
+                    hidden_states_scale,
+                    hidden_states.dtype,
+                )
+            if hidden_states.dim() != 2:
+                out = out.view(*hidden_states.shape[:-1], out.shape[-1])
+            return out
+
+        assert hidden_states_scale is None
         if self._wqa_wkv_mxfp8 is not None:
             return self._wqa_wkv_mxfp8(hidden_states)
         if self._wqa_wkv_scale is not None and hidden_states.dim() == 2:

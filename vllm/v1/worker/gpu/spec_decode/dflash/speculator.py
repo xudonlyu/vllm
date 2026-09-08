@@ -314,6 +314,29 @@ class DFlashSpeculator(DraftModelSpeculator):
         )
 
     @torch.inference_mode()
+    def _concat_aux_hidden_states(
+        self, aux_hidden_states: list[torch.Tensor]
+    ) -> torch.Tensor:
+        """Concatenate target aux states into a persistent staging buffer."""
+        num_tokens = aux_hidden_states[0].shape[0]
+        width = sum(x.shape[1] for x in aux_hidden_states)
+        buffer = getattr(self, "_aux_hidden_states_buffer", None)
+        if (
+            buffer is None
+            or buffer.shape[0] < num_tokens
+            or buffer.shape[1] != width
+            or buffer.dtype != aux_hidden_states[0].dtype
+            or buffer.device != aux_hidden_states[0].device
+        ):
+            buffer = torch.empty(
+                (max(self.max_num_tokens, num_tokens), width),
+                dtype=aux_hidden_states[0].dtype,
+                device=aux_hidden_states[0].device,
+            )
+            self._aux_hidden_states_buffer = buffer
+        return torch.cat(aux_hidden_states, dim=-1, out=buffer[:num_tokens])
+
+    @torch.inference_mode()
     def propose(
         self,
         input_batch: InputBatch,
@@ -355,7 +378,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         # request's query length to include any rejected positions.
         if aux_hidden_states:
             hidden_states = self.model.combine_hidden_states(
-                torch.cat(aux_hidden_states, dim=-1)
+                self._concat_aux_hidden_states(aux_hidden_states)
             )
         else:
             hidden_states = last_hidden_states

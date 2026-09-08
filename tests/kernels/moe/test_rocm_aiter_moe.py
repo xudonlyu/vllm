@@ -985,6 +985,102 @@ def test_aiter_mxfp4_quant_scheme_support_matches_gfx950():
 
 
 @pytest.mark.skipif(not on_gfx950(), reason="gfx950 ROCm only")
+@pytest.mark.parametrize(
+    "quant_limit,model_limit,expected_limit",
+    [
+        pytest.param(10.0, 20.0, 10.0, id="quant-limit"),
+        pytest.param(None, 10.0, 10.0, id="model-limit"),
+        pytest.param(0.0, 10.0, None, id="explicit-zero"),
+        pytest.param(None, None, None, id="unclamped"),
+    ],
+)
+def test_aiter_mxfp4_prequantized_moe_applies_clamp(
+    quant_limit, model_limit, expected_limit
+):
+    """Clamp routed gate/up values before the A4W4 intermediate quantization."""
+    from aiter import QuantType, dtypes, get_torch_quant
+    from aiter.utility.fp4_utils import e8m0_shuffle, e8m0_to_f32, mxfp4_to_f32
+
+    from tests.kernels.moe.utils import make_dummy_moe_config
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.config import ocp_mx_moe_quant_config
+    from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (
+        rocm_aiter_fused_experts,
+    )
+    from vllm.model_executor.layers.fused_moe.utils import aiter_mx_quantize_input
+
+    _assert_aiter_supported()
+    num_tokens, dim, num_experts, topk = 4, 256, 8, 6
+    hidden = torch.zeros(num_tokens, dim, device="cuda", dtype=torch.bfloat16)
+    hidden[:, 0] = hidden.new_tensor([1.0, 0.25, -1.0, 0.0])
+    signs = torch.ones(dim, device="cuda", dtype=torch.bfloat16)
+    signs[dim // 2 :] = -1
+    # Powers of two survive input/weight MXFP4 quantization exactly.
+    w1 = hidden.new_zeros(num_experts, 2 * dim, dim)
+    w1[:, :dim, 0] = 32
+    w1[:, dim:, 0] = 32 * signs
+    w2 = torch.eye(dim, device="cuda", dtype=torch.bfloat16)
+    w2 = w2.expand(num_experts, -1, -1).contiguous()
+    quantize = get_torch_quant(QuantType.per_1x32)
+    w1_q, w1_scale = quantize(w1, quant_dtype=dtypes.fp4x2)
+    w2_q, w2_scale = quantize(w2, quant_dtype=dtypes.fp4x2)
+    w1_q, w2_q = _shuffle_moe_weights(
+        w1_q.view(num_experts, 2 * dim, dim // 2),
+        w2_q.view(num_experts, dim, dim // 2),
+    )
+    quant_config = ocp_mx_moe_quant_config(
+        "mxfp4",
+        e8m0_shuffle(w1_scale),
+        e8m0_shuffle(w2_scale),
+        gemm1_clamp_limit=quant_limit,
+    )
+    moe_config = make_dummy_moe_config(
+        num_experts=num_experts,
+        experts_per_token=topk,
+        hidden_dim=dim,
+        intermediate_size=dim,
+        activation=MoEActivation.SILU,
+    )
+    moe_config.swiglu_limit = model_limit
+    topk_ids = torch.arange(topk, device="cuda", dtype=torch.int32)
+    topk_ids = topk_ids.expand(num_tokens, -1).contiguous()
+    topk_weights = torch.full((num_tokens, topk), 0.125, device="cuda")
+    hidden_q, hidden_scale = aiter_mx_quantize_input(hidden, dtypes.fp4x2)
+
+    gate = (hidden[:, :1].float() * 32).expand(-1, dim)
+    up = gate * signs
+    if expected_limit is not None:
+        gate = gate.clamp(max=expected_limit)
+        up = up.clamp(min=-expected_limit, max=expected_limit)
+    intermediate = (F.silu(gate) * up).to(torch.bfloat16)
+    intermediate_q, intermediate_scale = quantize(
+        intermediate, quant_dtype=dtypes.fp4x2
+    )
+    expected = mxfp4_to_f32(intermediate_q).view(num_tokens, dim)
+    expected *= (
+        e8m0_to_f32(intermediate_scale)
+        .view(num_tokens, -1)
+        .repeat_interleave(32, dim=-1)
+    )
+    expected *= topk * 0.125
+
+    output = rocm_aiter_fused_experts(
+        hidden_q,
+        w1_q,
+        w2_q,
+        topk_weights,
+        topk_ids,
+        moe_config,
+        activation=MoEActivation.SILU,
+        quant_config=quant_config,
+        a1q_scale=hidden_scale,
+        output_dtype=torch.bfloat16,
+    )
+
+    torch.testing.assert_close(output.float(), expected, atol=1e-4, rtol=0.01)
+
+
+@pytest.mark.skipif(not on_gfx950(), reason="gfx950 ROCm only")
 def test_aiter_fused_moe_mi350_mxfp4_w4a16_accuracy():
     """The gfx950 AITER MXFP4 W4A16 MoE path should match the dequantized
     MXFP4 reference."""

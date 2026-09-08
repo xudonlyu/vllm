@@ -418,6 +418,10 @@ def rocm_aiter_fused_experts(
                 else GateMode.SEPARATED.value
             )
 
+        swiglu_limit = quant_config.gemm1_clamp_limit
+        if swiglu_limit is None:
+            swiglu_limit = moe_config.swiglu_limit
+
         return rocm_aiter_ops.fused_moe(
             hidden_states,
             w1,
@@ -440,6 +444,7 @@ def rocm_aiter_fused_experts(
             bias1=quant_config.w1_bias if quant_config.use_mxfp4_w4a16 else None,
             bias2=quant_config.w2_bias if quant_config.use_mxfp4_w4a16 else None,
             moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
+            swiglu_limit=0.0 if swiglu_limit is None else swiglu_limit,
             beta=moe_config.activation_situ_beta,
             linear_beta=moe_config.activation_situ_linear_beta,
             has_fake_expert_slot=_has_fake_expert_slot(

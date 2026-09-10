@@ -167,20 +167,19 @@ class Mxfp8Gemm:
         # this avoids a round trip through fp32's <<23 / >>23.
         from vllm._aiter_ops import FP8_DTYPE
 
+        # With group 128 + e8m0, transpose_scale=True has the quant kernel write the
+        # compact layout directly, dropping the host-side A scale repack that ran on
+        # every GEMM (8.6us per call). The scattered write costs the quant kernel
+        # about 2% in return.
         xq, xs = get_hip_quant(QuantType.per_1x128)(
             x.contiguous(),
             quant_dtype=FP8_DTYPE,
-            transpose_scale=False,
+            transpose_scale=True,
             scale_type=dtypes.fp8_e8m0,
         )
-        k_blocks = k // _BLOCK_K
-        xs = xs.view(torch.uint8)
-        xs = (
-            xs.reshape(m, k_blocks)
-            if xs.shape[0] == m
-            else xs.reshape(k_blocks, m).t().contiguous()
-        )
-        a_scale = compact_scale_w4(xs, 1, k)
+        # uint32 is the dtype run_gemm takes as "already a compact buffer"; this is a
+        # bit reinterpretation, not a copy.
+        a_scale = xs.reshape(-1).view(torch.uint32)
         wq = w.view(torch.float8_e4m3fn) if w.dtype == torch.uint8 else w
         out = x.new_empty(m, n)
         return run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx950(

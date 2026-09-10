@@ -449,7 +449,9 @@ class DeepseekCompressor(nn.Module):
         else:
             # Indexer path (head_dim == 128) or non-CUDA GPUs (AMD, XPU, etc.).
             compress_norm_rope_store_fn = compress_norm_rope_store_triton
-            extra_kwargs = {}
+            extra_kwargs = {
+                "preshuffle": current_platform.is_rocm() and kv_cache.shape[1] > 1
+            }
 
         compress_norm_rope_store_fn(
             state_cache=state_cache,

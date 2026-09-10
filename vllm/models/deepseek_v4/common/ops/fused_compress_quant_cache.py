@@ -58,6 +58,7 @@ def compress_norm_rope_store_triton(
     quant_block: int,
     token_stride: int,
     scale_dim: int,
+    preshuffle: bool = False,
 ) -> None:
     """Shared triton launcher for the fused compress+norm+RoPE+insert path.
 
@@ -75,7 +76,12 @@ def compress_norm_rope_store_triton(
     else:
         kernel = _fused_kv_compress_norm_rope_insert_indexer_attn
         num_warps = 1
-        kernel_kwargs = {}
+        if preshuffle and kv_cache.shape[1] % 16 != 0:
+            raise ValueError(
+                "ROCm indexer KV-cache preshuffle requires a block size "
+                f"divisible by 16, got {kv_cache.shape[1]}."
+            )
+        kernel_kwargs = {"PRESHUFFLE_CACHE": preshuffle}
 
     kernel[(num_actual,)](
         # state cache
@@ -667,6 +673,7 @@ def compress_norm_rope_store_two_stage_triton(
             quant_block=quant_block,
             token_stride=token_stride,
             scale_dim=scale_dim,
+            preshuffle=False,
         )
 
 
@@ -708,13 +715,14 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     TOKEN_STRIDE: tl.constexpr,  # 128 for indexer
     SCALE_DIM: tl.constexpr,  # 4 for indexer (1 float32)
     KV_BLOCK_STRIDE: tl.constexpr,
+    PRESHUFFLE_CACHE: tl.constexpr = False,
 ):
     """Fused compress → RMSNorm → RoPE → FP8 quant → store.
 
     One program per token; early-exits for non-boundary positions.
 
     Cache block layout:
-      [0, bs*128):       FP8 data (128 bytes/token)
+      [0, bs*128):       FP8 data (token-major or ROCm 16x16 preshuffled)
       [bs*128, +bs*4):   float32 scales (4 bytes/token)
 
     For head_dim=128 we have exactly one quant block, so we skip the
@@ -790,7 +798,20 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     kv_pos_in_block = kv_slot_idx % kv_cache_block_size
 
     cache_block_ptr = k_cache_ptr + kv_block_idx.to(tl.int64) * KV_BLOCK_STRIDE
-    fp8_ptr = cache_block_ptr + kv_pos_in_block * TOKEN_STRIDE
+    if PRESHUFFLE_CACHE:
+        CACHE_TILE: tl.constexpr = 16
+        tl.static_assert(HEAD_SIZE % CACHE_TILE == 0)
+        fp8_ptr = (
+            cache_block_ptr
+            + (kv_pos_in_block // CACHE_TILE) * CACHE_TILE * HEAD_SIZE
+            + (kv_pos_in_block % CACHE_TILE) * CACHE_TILE
+        )
+        fp8_offsets = (
+            block // CACHE_TILE
+        ) * CACHE_TILE * CACHE_TILE + block % CACHE_TILE
+    else:
+        fp8_ptr = cache_block_ptr + kv_pos_in_block * TOKEN_STRIDE
+        fp8_offsets = block
     scale_ptr = (
         cache_block_ptr
         + kv_cache_block_size * TOKEN_STRIDE
@@ -840,7 +861,7 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     x_fp8 = x_clamped.to(tl.float8e4nv)
     x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
 
-    tl.store(fp8_ptr + block, x_uint8, mask=mask)
+    tl.store(fp8_ptr + fp8_offsets, x_uint8, mask=mask)
 
     # Single float32 scale
     scale_val = tl.exp2(exponent)
